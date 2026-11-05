@@ -1,16 +1,20 @@
-name: FFmpeg Sherpya XP
+name: FFmpeg XP (Sherpya)
+
+# Compila o sherpya/ffmpeg (ffmpeg.exe, ffplay.exe, ffprobe.exe) para Windows XP (32 bits)
+# sempre que o repositorio original recebe novos commits na branch principal.
+# Consulta a API do GitHub de 6 em 6 horas.
 
 on:
   schedule:
     - cron: "17 */6 * * *"
   workflow_dispatch:
     inputs:
-      commit_ref:
-        description: "Commit SHA ou ramo a compilar (vazio = master)"
+      commit:
+        description: "Commit/branch/tag upstream a compilar (vazio = ultimo commit)"
         required: false
         default: ""
       force:
-        description: "Recompilar mesmo que a release ja exista"
+        description: "Recompilar mesmo que a release ja exista (substitui-a)"
         type: boolean
         default: false
 
@@ -18,11 +22,11 @@ permissions:
   contents: write
 
 concurrency:
-  group: ffmpeg-sherpya-xp
+  group: ffmpeg-xp
   cancel-in-progress: false
 
 env:
-  UPSTREAM: sherpya/FFmpeg
+  UPSTREAM: sherpya/ffmpeg
 
 jobs:
   check:
@@ -32,38 +36,40 @@ jobs:
       tag: ${{ steps.up.outputs.tag }}
       sha: ${{ steps.up.outputs.sha }}
       build: ${{ steps.up.outputs.build }}
-      date: ${{ steps.up.outputs.date }}
-      msg: ${{ steps.up.outputs.msg }}
     steps:
       - id: up
         env:
           GH_TOKEN: ${{ github.token }}
-          INPUT_REF: ${{ inputs.commit_ref }}
+          INPUT_COMMIT: ${{ inputs.commit }}
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
-          ref="${INPUT_REF:-master}"
-          commit_json=$(gh api "repos/$UPSTREAM/commits/$ref")
+          if [ -n "$INPUT_COMMIT" ]; then
+            [[ "$INPUT_COMMIT" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::referencia invalida: $INPUT_COMMIT"; exit 1; }
+            ref="$INPUT_COMMIT"
+          else
+            ref=$(gh api "repos/$UPSTREAM" --jq '.default_branch')
+          fi
+
+          commit_json=$(gh api "repos/$UPSTREAM/commits/$ref") \
+            || { echo "::error::Nao foi possivel obter o commit '$ref' em $UPSTREAM"; exit 1; }
+
           sha=$(echo "$commit_json" | jq -r '.sha')
           short_sha="${sha:0:7}"
-          commit_date=$(echo "$commit_json" | jq -r '.commit.committer.date' | cut -d'T' -f1 | tr -d '-')
-          commit_msg=$(echo "$commit_json" | jq -r '.commit.message' | head -n1)
-
-          tag="snapshot-${commit_date}-${short_sha}"
+          commit_date=$(echo "$commit_json" | jq -r '.commit.committer.date' | cut -dT -f1 | tr -d '-')
+          tag="git-${commit_date}-${short_sha}"
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "$FORCE" != "true" ]; then
             build=false
-            echo "Release $tag ja existe em $GITHUB_REPOSITORY; nada a fazer."
+            echo "Release $tag ($sha) ja existe em $GITHUB_REPOSITORY; nada a fazer."
           else
             build=true
-            echo "A compilar commit $sha com a tag $tag."
+            echo "A compilar $tag (commit $sha)."
           fi
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "build=$build" >> "$GITHUB_OUTPUT"
-          echo "date=$commit_date" >> "$GITHUB_OUTPUT"
-          echo "msg=$commit_msg" >> "$GITHUB_OUTPUT"
 
   build:
     name: Compilar (${{ matrix.variant }})
@@ -75,93 +81,277 @@ jobs:
       matrix:
         variant: [prescott, generic]
     steps:
-      - name: Instalar dependencias de compilacao
+      - name: Instalar dependencias e toolchain MinGW-w64 (win32 threads)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            gcc-mingw-w64-i686-posix g++-mingw-w64-i686-posix binutils-mingw-w64-i686 \
-            mingw-w64-i686-dev make git curl ca-certificates xz-utils zip yasm nasm pkg-config
+            gcc-mingw-w64-i686-win32 g++-mingw-w64-i686-win32 binutils-mingw-w64-i686 \
+            mingw-w64-i686-dev nasm yasm pkg-config cmake make autoconf automake libtool \
+            git curl wget ca-certificates xz-utils bzip2 zip jq
+          sudo update-alternatives --set i686-w64-mingw32-gcc /usr/bin/i686-w64-mingw32-gcc-win32
+          sudo update-alternatives --set i686-w64-mingw32-g++ /usr/bin/i686-w64-mingw32-g++-win32
 
-      - name: Instalar SDL2 para ffplay (compativel com XP)
-        run: |
-          curl -sLO https://github.com/libsdl-org/SDL/releases/download/release-2.28.5/SDL2-devel-2.28.5-mingw.tar.gz
-          tar -xzf SDL2-devel-2.28.5-mingw.tar.gz
-          sudo cp -r SDL2-2.28.5/i686-w64-mingw32/* /usr/i686-w64-mingw32/
-          sudo sed -i 's|/opt/local/i686-w64-mingw32|/usr/i686-w64-mingw32|g' /usr/i686-w64-mingw32/bin/sdl2-config
-          sudo sed -i 's|/opt/local/i686-w64-mingw32|/usr/i686-w64-mingw32|g' /usr/i686-w64-mingw32/lib/pkgconfig/sdl2.pc
-          sudo cp /usr/i686-w64-mingw32/bin/sdl2-config /usr/local/bin/i686-w64-mingw32-sdl2-config
-
-      - name: Obter codigo de sherpya/FFmpeg
-        run: |
-          git clone "https://github.com/${{ env.UPSTREAM }}.git" ffmpeg
-          cd ffmpeg
-          git checkout ${{ needs.check.outputs.sha }}
-
-      - name: Configurar e Compilar
-        id: compile
+      - name: Compilar dependencias estaticas e FFmpeg
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          COMMIT_SHA: ${{ needs.check.outputs.sha }}
+          VARIANT: ${{ matrix.variant }}
         run: |
           set -euo pipefail
-          cd ffmpeg
 
-          TARGET_CPU="${{ matrix.variant }}"
-          COMMON_CFLAGS="-O3 -fomit-frame-pointer -DWINVER=0x0501 -D_WIN32_WINNT=0x0501"
+          WORKDIR="$GITHUB_WORKSPACE/build"
+          SRC="$WORKDIR/src"
+          PREFIX="$WORKDIR/prefix"
+          LOGS="$WORKDIR/logs"
+          REL="$WORKDIR/release"
+          mkdir -p "$SRC" "$PREFIX/include" "$PREFIX/lib/pkgconfig" "$PREFIX/bin" "$LOGS" "$REL"
 
-          if [ "$TARGET_CPU" = "prescott" ]; then
-            CPU_FLAG="--cpu=prescott"
-            OPT_CFLAGS="${COMMON_CFLAGS} -march=prescott -mtune=prescott -mfpmath=sse"
+          export PATH="$PREFIX/bin:$PATH"
+          export PKG_CONFIG_DIR=""
+          export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig"
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig"
+          JOBS=$(nproc)
+
+          # Flags de compatibilidade estrita com Windows XP SP3 (NT 5.01)
+          XP_CPPFLAGS="-D_WIN32_WINNT=0x0501 -DWINVER=0x0501 -DNDEBUG"
+          XP_LDFLAGS="-Wl,--major-os-version=5 -Wl,--minor-os-version=1 -Wl,--major-subsystem-version=5 -Wl,--minor-subsystem-version=1 -Wl,--gc-sections -s"
+
+          if [ "$VARIANT" = "prescott" ]; then
+            # Pentium 4 HT Prescott (NetBurst): -O2 + vectorizacao evita saturar a Trace Cache (12K uOps),
+            # enquanto -msse3 e -mfpmath=sse usam os registos SSE3 em vez da lenta FPU x87.
+            CPU_FLAGS="-O2 -ftree-vectorize -march=prescott -mtune=prescott -msse3 -mfpmath=sse -fomit-frame-pointer -ffunction-sections -fdata-sections"
+            FF_CPU="prescott"
           else
-            CPU_FLAG="--cpu=i686"
-            OPT_CFLAGS="${COMMON_CFLAGS} -march=i686 -mtune=generic"
+            # i686 generico sem SSE obrigatorio no codigo C (mantem deteccao de CPU em runtime para Assembly)
+            CPU_FLAGS="-O2 -march=i686 -mtune=generic -fomit-frame-pointer -ffunction-sections -fdata-sections"
+            FF_CPU="i686"
           fi
 
-          export PKG_CONFIG_PATH="/usr/i686-w64-mingw32/lib/pkgconfig"
-          export PKG_CONFIG_LIBDIR="/usr/i686-w64-mingw32/lib/pkgconfig"
+          export CFLAGS="$CPU_FLAGS $XP_CPPFLAGS"
+          export CXXFLAGS="$CPU_FLAGS $XP_CPPFLAGS"
+          export CPPFLAGS="$XP_CPPFLAGS -I$PREFIX/include"
+          export LDFLAGS="$XP_LDFLAGS -L$PREFIX/lib"
 
-          ./configure \
-            --prefix=./dist \
-            --cross-prefix=i686-w64-mingw32- \
-            --target-os=mingw32 \
-            --arch=x86 \
-            ${CPU_FLAG} \
-            --extra-version="sherpya-xp" \
-            --enable-gpl \
-            --enable-version3 \
-            --enable-static \
-            --disable-shared \
-            --disable-debug \
-            --disable-doc \
+          echo "=== [1/11] zlib ==="
+          cd "$SRC"
+          curl -fsSL https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.xz | tar -xJ
+          cd zlib-1.3.1
+          make -f win32/Makefile.gcc PREFIX=i686-w64-mingw32- CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS" -j"$JOBS" >"$LOGS/zlib.log" 2>&1
+          make -f win32/Makefile.gcc install BINARY_PATH="$PREFIX/bin" INCLUDE_PATH="$PREFIX/include" LIBRARY_PATH="$PREFIX/lib" SHARED_MODE=0 >>"$LOGS/zlib.log" 2>&1
+
+          echo "=== [2/11] bzip2 ==="
+          cd "$SRC"
+          curl -fsSL https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz | tar -xz
+          cd bzip2-1.0.8
+          make CC="i686-w64-mingw32-gcc" AR="i686-w64-mingw32-ar" RANLIB="i686-w64-mingw32-ranlib" \
+            CFLAGS="$CFLAGS -D_FILE_OFFSET_BITS=64" libbz2.a -j"$JOBS" >"$LOGS/bzip2.log" 2>&1
+          cp -f bzlib.h "$PREFIX/include/"
+          cp -f libbz2.a "$PREFIX/lib/"
+
+          echo "=== [3/11] xz (liblzma com threads win95/xp) ==="
+          cd "$SRC"
+          curl -fsSL https://github.com/tukaani-project/xz/releases/download/v5.4.7/xz-5.4.7.tar.xz | tar -xJ
+          cd xz-5.4.7
+          ./configure --host=i686-w64-mingw32 --prefix="$PREFIX" --enable-static --disable-shared \
+            --enable-threads=win95 --disable-xz --disable-xzdec --disable-lzmadec --disable-lzmainfo \
+            --disable-scripts --disable-doc >"$LOGS/xz.log" 2>&1
+          make -j"$JOBS" >>"$LOGS/xz.log" 2>&1
+          make install >>"$LOGS/xz.log" 2>&1
+
+          echo "=== [4/11] libiconv ==="
+          cd "$SRC"
+          curl -fsSL https://ftp.gnu.org/gnu/libiconv/libiconv-1.17.tar.gz | tar -xz
+          cd libiconv-1.17
+          ./configure --host=i686-w64-mingw32 --prefix="$PREFIX" --enable-static --disable-shared --disable-nls >"$LOGS/iconv.log" 2>&1
+          make -j"$JOBS" >>"$LOGS/iconv.log" 2>&1
+          make install >>"$LOGS/iconv.log" 2>&1
+
+          echo "=== [5/11] mbedtls (suporte HTTPS/TLS 1.2 em XP) ==="
+          cd "$SRC"
+          curl -fsSL https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/v2.28.8.tar.gz | tar -xz
+          cd mbedtls-2.28.8
+          make CC="i686-w64-mingw32-gcc" AR="i686-w64-mingw32-ar" WINDOWS=1 CFLAGS="$CFLAGS" lib -j"$JOBS" >"$LOGS/mbedtls.log" 2>&1
+          cp -r include/mbedtls include/psa "$PREFIX/include/"
+          cp library/*.a "$PREFIX/lib/"
+          cat > "$PREFIX/lib/pkgconfig/mbedtls.pc" <<EOF
+          prefix=$PREFIX
+          exec_prefix=\${prefix}
+          libdir=\${exec_prefix}/lib
+          includedir=\${prefix}/include
+          Name: mbedtls
+          Description: Mbed TLS
+          Version: 2.28.8
+          Libs: -L\${libdir} -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -lcrypt32 -ladvapi32
+          Cflags: -I\${includedir}
+          EOF
+
+          echo "=== [6/11] SDL2 (necessario para ffplay.exe; Direct3D9/OpenGL/DirectSound) ==="
+          cd "$SRC"
+          curl -fsSL https://github.com/libsdl-org/SDL/releases/download/release-2.28.5/SDL2-2.28.5.tar.gz | tar -xz
+          cd SDL2-2.28.5
+          ./configure --host=i686-w64-mingw32 --prefix="$PREFIX" --enable-static --disable-shared \
+            --disable-sensor --disable-hidapi --disable-power --disable-haptic >"$LOGS/sdl2.log" 2>&1
+          make -j"$JOBS" >>"$LOGS/sdl2.log" 2>&1
+          make install >>"$LOGS/sdl2.log" 2>&1
+
+          echo "=== [7/11] libogg & libvorbis ==="
+          cd "$SRC"
+          curl -fsSL https://downloads.xiph.org/releases/ogg/libogg-1.3.5.tar.xz | tar -xJ
+          cd libogg-1.3.5
+          ./configure --host=i686-w64-mingw32 --prefix="$PREFIX" --enable-static --disable-shared >"$LOGS/ogg.log" 2>&1
+          make -j"$JOBS" >>"$LOGS/ogg.log" 2>&1
+          make install >>"$LOGS/ogg.log" 2>&1
+
+          cd "$SRC"
+          curl -fsSL https://downloads.xiph.org/releases/vorbis/libvorbis-1.3.7.tar.xz | tar -xJ
+          cd libvorbis-1.3.7
+          ./configure --host=i686-w64-mingw32 --prefix="$PREFIX" --enable-static --disable-shared --disable-oggtest >"$LOGS/vorbis.log" 2>&1
+          make -j"$JOBS" >>"$LOGS/vorbis.log" 2>&1
+          make install >>"$LOGS/vorbis.log" 2>&1
+
+          echo "=== [8/11] libopus ==="
+          cd "$SRC"
+          curl -fsSL https://downloads.xiph.org/releases/opus/opus-1.5.2.tar.gz | tar -xz
+          cd opus-1.5.2
+          ./configure --host=i686-w64-mingw32 --prefix="$PREFIX" --enable-static --disable-shared \
+            --disable-doc --disable-extra-programs >"$LOGS/opus.log" 2>&1
+          make -j"$JOBS" >>"$LOGS/opus.log" 2>&1
+          make install >>"$LOGS/opus.log" 2>&1
+
+          echo "=== [9/11] libmp3lame ==="
+          cd "$SRC"
+          curl -fsSL https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz | tar -xz
+          cd lame-3.100
+          ./configure --host=i686-w64-mingw32 --prefix="$PREFIX" --enable-static --disable-shared \
+            --enable-nasm --disable-frontend --disable-decoder >"$LOGS/lame.log" 2>&1
+          make -j"$JOBS" >>"$LOGS/lame.log" 2>&1
+          make install >>"$LOGS/lame.log" 2>&1
+
+          echo "=== [10/11] xvidcore & x264 ==="
+          cd "$SRC"
+          curl -fsSL https://downloads.xvid.com/downloads/xvidcore-1.3.7.tar.gz | tar -xz
+          cd xvidcore/build/generic
+          ./configure --host=i686-w64-mingw32 --prefix="$PREFIX" >"$LOGS/xvid.log" 2>&1
+          make -j"$JOBS" >>"$LOGS/xvid.log" 2>&1
+          make install >>"$LOGS/xvid.log" 2>&1
+          [ -f "$PREFIX/lib/xvidcore.a" ] && mv -f "$PREFIX/lib/xvidcore.a" "$PREFIX/lib/libxvidcore.a"
+          rm -f "$PREFIX/lib/xvidcore.dll"* "$PREFIX/bin/xvidcore.dll"
+
+          cd "$SRC"
+          git clone --depth 1 --branch stable https://code.videolan.org/videolan/x264.git
+          cd x264
+          ./configure --host=i686-w64-mingw32 --cross-prefix=i686-w64-mingw32- --prefix="$PREFIX" \
+            --enable-static --enable-strip --enable-win32thread --disable-cli --disable-swscale --disable-lavf \
+            --extra-cflags="$CFLAGS" --extra-ldflags="$LDFLAGS" >"$LOGS/x264.log" 2>&1
+          make -j"$JOBS" >>"$LOGS/x264.log" 2>&1
+          make install >>"$LOGS/x264.log" 2>&1
+
+          echo "=== [11/11] sherpya/ffmpeg ($COMMIT_SHA) ==="
+          mkdir -p "$SRC/ffmpeg"
+          cd "$SRC/ffmpeg"
+          git init
+          git remote add origin "https://github.com/$UPSTREAM.git"
+          git fetch --depth 1 origin "$COMMIT_SHA"
+          git checkout FETCH_HEAD
+
+          # Garante que nas diferentes revisoes do sherpya/ffmpeg apenas passamos flags suportadas
+          EXTRA_FF_FLAGS=()
+          for opt in \
             --disable-bcrypt \
             --disable-mediafoundation \
-            --disable-w32threads \
-            --enable-pthreads \
-            --enable-hardcoded-tables \
-            --enable-sdl2 \
+            --disable-d3d11va \
+            --disable-d3d12va \
+            --disable-dxva2 \
+            --disable-vulkan \
+            --disable-schannel; do
+            if ./configure --help | grep -q -- "$opt"; then
+              EXTRA_FF_FLAGS+=("$opt")
+            fi
+          done
+
+          ./configure \
+            --prefix="$PREFIX" \
+            --arch=x86_32 \
+            --cpu="$FF_CPU" \
+            --target-os=mingw32 \
+            --cross-prefix=i686-w64-mingw32- \
+            --pkg-config=pkg-config \
+            --pkg-config-flags="--static" \
+            --optflags="$CPU_FLAGS" \
+            --extra-cflags="$CFLAGS -I$PREFIX/include" \
+            --extra-cxxflags="$CXXFLAGS -I$PREFIX/include" \
+            --extra-ldflags="$LDFLAGS -L$PREFIX/lib -static -static-libgcc -static-libstdc++ -s" \
+            --extra-libs="-lws2_32 -lwinmm -lgdi32 -lole32 -loleaut32 -limm32 -lversion -luuid -ladvapi32 -lshell32 -lsetupapi -lcrypt32 -lm" \
+            --enable-static \
+            --disable-shared \
+            --enable-gpl \
+            --enable-version3 \
+            --enable-w32threads \
+            --disable-pthreads \
+            --enable-runtime-cpudetect \
+            --enable-ffmpeg \
             --enable-ffplay \
-            --extra-cflags="${OPT_CFLAGS}" \
-            --extra-ldflags="-static -Wl,--subsystem,console:5.01"
+            --enable-ffprobe \
+            --disable-doc \
+            --disable-debug \
+            --enable-stripping \
+            --enable-zlib \
+            --enable-bzlib \
+            --enable-lzma \
+            --enable-iconv \
+            --enable-sdl2 \
+            --enable-mbedtls \
+            --enable-libmp3lame \
+            --enable-libvorbis \
+            --enable-libopus \
+            --enable-libx264 \
+            --enable-libxvid \
+            "${EXTRA_FF_FLAGS[@]}" >"$LOGS/ffmpeg_configure.log" 2>&1 || {
+              cat "$LOGS/ffmpeg_configure.log"
+              [ -f ffbuild/config.log ] && cp ffbuild/config.log "$LOGS/" && tail -n 100 ffbuild/config.log
+              exit 1
+            }
 
-          make -j$(nproc)
+          make -j"$JOBS" >"$LOGS/ffmpeg_build.log" 2>&1
+          make install >>"$LOGS/ffmpeg_build.log" 2>&1
 
-          # Reducao estrita de tamanho (remover tabelas de simbolos)
-          i686-w64-mingw32-strip -s --strip-all ffmpeg.exe ffprobe.exe ffplay.exe
+          # Strip total de simbolos e validacao de binarios XP
+          STAGE="$WORKDIR/package/ffmpeg-${TAG}-xp_${VARIANT}"
+          mkdir -p "$STAGE"
+          for bin in ffmpeg.exe ffplay.exe ffprobe.exe; do
+            if [ ! -f "$PREFIX/bin/$bin" ]; then
+              echo "::error::Binario $bin nao foi gerado!"
+              exit 1
+            fi
+            i686-w64-mingw32-strip --strip-all "$PREFIX/bin/$bin" -o "$STAGE/$bin"
 
-          mkdir -p ../out
-          cp ffmpeg.exe ffprobe.exe ffplay.exe ../out/
-          cp /usr/i686-w64-mingw32/bin/SDL2.dll ../out/
+            # Verifica que nenhuma DLL exclusiva do Vista+ ou pthread externa foi ligada
+            dlls=$(i686-w64-mingw32-objdump -p "$STAGE/$bin" | awk '/DLL Name:/{print $3}')
+            echo "DLLs importadas por $bin:"
+            echo "$dlls"
+            if echo "$dlls" | grep -Eqi '^(bcrypt|ncrypt|mfplat|d3d11|dxva2|libwinpthread).*\.dll$'; then
+              echo "::error::$bin importa DLL incompativel com Windows XP!"
+              exit 1
+            fi
+          done
 
-      - name: Empacotar ZIP
-        run: |
-          set -euo pipefail
-          mkdir -p pkg
-          ZIP_NAME="ffmpeg-${{ needs.check.outputs.tag }}-xp_${{ matrix.variant }}.zip"
-          (cd out && zip -9 "../pkg/${ZIP_NAME}" ffmpeg.exe ffprobe.exe ffplay.exe SDL2.dll)
+          cp -f COPYING* LICENSE* README* "$STAGE/" 2>/dev/null || true
+          (cd "$WORKDIR/package" && zip -9 -r "$REL/ffmpeg-${TAG}-xp_${VARIANT}.zip" "ffmpeg-${TAG}-xp_${VARIANT}")
 
       - name: Guardar pacote
         uses: actions/upload-artifact@v4
         with:
           name: xp_${{ matrix.variant }}
-          path: pkg/*.zip
+          path: build/release/*.zip
           if-no-files-found: error
+
+      - name: Guardar logs (falha)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs_${{ matrix.variant }}
+          path: build/logs
+          if-no-files-found: ignore
 
   release:
     name: Publicar release
@@ -179,31 +369,34 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.check.outputs.tag }}
           SHA: ${{ needs.check.outputs.sha }}
-          DATE: ${{ needs.check.outputs.date }}
-          MSG: ${{ needs.check.outputs.msg }}
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
+          gh api "repos/$UPSTREAM/commits/$SHA" > up.json
+          url=$(jq -r '.html_url' up.json)
+          published=$(jq -r '.commit.committer.date' up.json)
+          author=$(jq -r '.author.login // .commit.author.name // "desconhecido"' up.json)
+          short_sha="${SHA:0:7}"
 
-          url="https://github.com/${UPSTREAM}/commit/${SHA}"
+          jq -r '.commit.message // ""' up.json \
+            | sed -E "s@(^|[^A-Za-z0-9/&])#([0-9]+)@\1${UPSTREAM}#\2@g" > body.md
 
           {
-            echo "> **Compilação estática não oficial para Windows XP (32 bits)** de [\`${UPSTREAM}\`](${url})."
-            echo "> Commit: \`${SHA}\` (${DATE}) — *\"${MSG}\"*"
-            echo "> Inclui os patches de Gianluigi Tiesi (Sherpya) com recursos e ícones Win32 nativos."
+            echo "> **Build nao oficial para Windows XP (32 bits)** do commit [\`${short_sha}\`](${url}) de \`${UPSTREAM}\`."
+            echo "> Data do commit original: ${published} por **${author}**."
             echo ">"
-            echo "> | Ficheiro | Arquitectura / Optimização |"
+            echo "> | Ficheiro | Optimizacao |"
             echo "> |---|---|"
-            echo "> | \`ffmpeg-${TAG}-xp_prescott.zip\` | Pentium 4 Prescott (\`--cpu=prescott\`, SSE3, \`-mfpmath=sse\`) |"
-            echo "> | \`ffmpeg-${TAG}-xp_generic.zip\` | Genérica x86 (\`--cpu=i686\`, runtime-cpudetect) |"
+            echo "> | \`ffmpeg-${TAG}-xp_prescott.zip\` | Pentium 4 HT Prescott (\`-O2 -ftree-vectorize -march=prescott -msse3 -mfpmath=sse\`) |"
+            echo "> | \`ffmpeg-${TAG}-xp_generic.zip\` | Generica (\`-O2 -march=i686\`, deteccao de SIMD em runtime) |"
             echo ">"
-            echo "> Conteúdo de cada arquivo ZIP:"
-            echo "> - \`ffmpeg.exe\` (linha de comandos)"
-            echo "> - \`ffprobe.exe\` (análise de média)"
-            echo "> - \`ffplay.exe\` (reprodutor de vídeo/áudio via SDL2)"
-            echo "> - \`SDL2.dll\` (biblioteca necessária para a execução do ffplay)"
-            echo ">"
-            echo "> Subsistema PE forçado a 5.01 (compatibilidade nativa com Windows XP SP2/SP3 sem erros de DLL ausente)."
+            echo "> **Inclui:** \`ffmpeg.exe\`, \`ffplay.exe\` e \`ffprobe.exe\` (100% estaticos, stripped, Subsystem 5.01 / Windows XP SP3)."
+            echo "> **Bibliotecas integradas:** SDL2 (Direct3D 9 / OpenGL / DirectSound / WinMM), x264, Xvid, LAME MP3, Opus, Vorbis, MbedTLS (HTTPS/TLS 1.2), zlib, bzip2, lzma, iconv."
+            echo ""
+            echo "---"
+            echo "### Mensagem do commit upstream"
+            echo ""
+            cat body.md
           } > notes.md
 
           (cd dist && sha256sum ./*.zip | sed 's| \./| |' > SHA256SUMS && cat SHA256SUMS)
@@ -212,8 +405,12 @@ jobs:
             gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
           fi
 
+          default_branch=$(gh api "repos/$UPSTREAM" --jq '.default_branch')
+          latest_sha=$(gh api "repos/$UPSTREAM/commits/$default_branch" --jq '.sha')
+          if [ "$SHA" = "$latest_sha" ]; then latest=true; else latest=false; fi
+
           gh release create "$TAG" dist/*.zip dist/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
-            --title "FFmpeg XP (${TAG})" \
+            --title "FFmpeg XP ${TAG}" \
             --notes-file notes.md \
-            --latest=true
+            --latest="$latest"
