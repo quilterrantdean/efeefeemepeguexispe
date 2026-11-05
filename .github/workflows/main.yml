@@ -84,15 +84,12 @@ jobs:
     if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    strategy:
-      fail-fast: true
-      matrix:
-        variant: [prescott]
-        # para voltar a ativar a generica: variant: [prescott, generic]
     env:
       ROOT: ${{ github.workspace }}/build
       HOST: i686-w64-mingw32
-      VARIANT: ${{ matrix.variant }}
+      # para voltar a ter a variante generica, muda para "generic"
+      # (o ramo existe no script) ou volta a usar uma matrix
+      VARIANT: prescott
       TAG: ${{ needs.check.outputs.tag }}
       COMMIT_SHA: ${{ needs.check.outputs.sha }}
     steps:
@@ -104,7 +101,7 @@ jobs:
             gcc-mingw-w64-i686-win32 g++-mingw-w64-i686-win32 \
             binutils-mingw-w64-i686 mingw-w64-i686-dev \
             nasm yasm pkg-config make autoconf automake libtool \
-            git curl ca-certificates xz-utils bzip2 zip jq
+            git curl ca-certificates xz-utils bzip2 zip jq python3
           sudo update-alternatives --set i686-w64-mingw32-gcc /usr/bin/i686-w64-mingw32-gcc-win32 || true
           sudo update-alternatives --set i686-w64-mingw32-g++ /usr/bin/i686-w64-mingw32-g++-win32 || true
           i686-w64-mingw32-gcc --version | sed -n 1p
@@ -112,6 +109,7 @@ jobs:
       - name: Compilar dependencias e FFmpeg
         run: |
           set -euo pipefail
+          export LC_ALL=C   # mensagens do compilador em ASCII (para o filtro de erros)
 
           SRC="$ROOT/src"
           PREFIX="$ROOT/prefix"
@@ -121,6 +119,15 @@ jobs:
           mkdir -p "$SRC" "$PREFIX/bin" "$PREFIX/include" "$PREFIX/lib/pkgconfig" "$LOGS" "$META"
 
           # ---------- funcoes auxiliares ----------
+          show_fail() {
+            local name="$1"; shift
+            echo "::error::Falhou [$name]: $*"
+            echo "-------- erros encontrados em $name.log --------"
+            grep -nE "error:|Error [0-9]+|undefined reference|No such file|\*\*\*" "$LOGS/$name.log" | cut -c1-300 | sed -n 1,60p || true
+            echo "-------- ultimas 150 linhas de $name.log --------"
+            tail -n 150 "$LOGS/$name.log"
+          }
+
           run() {
             local name="$1"; shift
             echo "+ $*" >> "$LOGS/$name.log"
@@ -128,11 +135,7 @@ jobs:
               return 0
             fi
             if [ "${RUN_QUIET:-0}" != "1" ]; then
-              echo "::error::Falhou [$name]: $*"
-              echo "-------- erros encontrados em $name.log --------"
-              grep -nE "error:|Error [0-9]+|undefined reference|No such file|\*\*\*" "$LOGS/$name.log" | cut -c1-300 | sed -n 1,60p || true
-              echo "-------- ultimas 150 linhas de $name.log --------"
-              tail -n 150 "$LOGS/$name.log"
+              show_fail "$name" "$@"
             fi
             return 1
           }
@@ -140,8 +143,8 @@ jobs:
           fetch() {
             local url="$1" f
             f="$(mktemp -p "$ROOT")"
-            curl -fL -sS --retry 5 --retry-delay 3 --retry-all-errors -o "$f" "$url"
-            tar -xf "$f" -C "$SRC"
+            curl -fL -sS --retry 5 --retry-delay 3 --retry-all-errors -o "$f" "$url" || { rm -f "$f"; return 1; }
+            tar -xf "$f" -C "$SRC" || { rm -f "$f"; return 1; }
             rm -f "$f"
           }
 
@@ -216,25 +219,39 @@ jobs:
           run iconv make -j"$JOBS"
           run iconv make install
 
-          # ---------- [5/10] mbedtls ----------
-          echo "=== [5/10] mbedtls 2.28 (HTTPS/TLS 1.2, usa CryptGenRandom => OK no XP) ==="
-          fetch https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/v2.28.8.tar.gz
-          cd "$SRC/mbedtls-2.28.8"
-          run mbedtls make -j"$JOBS" lib WINDOWS=1 CC="$CC" AR="$AR" CFLAGS="$CPPFLAGS $CFLAGS"
-          cp -r include/mbedtls include/psa "$PREFIX/include/"
-          cp library/libmbedtls.a library/libmbedx509.a library/libmbedcrypto.a "$PREFIX/lib/"
-          printf '%s\n' \
-            "prefix=$PREFIX" \
-            'exec_prefix=${prefix}' \
-            'libdir=${exec_prefix}/lib' \
-            'includedir=${prefix}/include' \
-            '' \
-            'Name: mbedtls' \
-            'Description: mbed TLS' \
-            'Version: 2.28.8' \
-            'Libs: -L${libdir} -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -ladvapi32' \
-            'Cflags: -I${includedir}' \
-            > "$PREFIX/lib/pkgconfig/mbedtls.pc"
+          # ---------- [5/10] mbedtls 3.6 ----------
+          # Nao e fatal: se falhar, o FFmpeg e compilado sem TLS (sem HTTPS).
+          # A fonte de entropia nativa (BCryptGenRandom) nao existe no XP; e
+          # substituida por mbedtls_hardware_poll (CryptGenRandom), que fica
+          # no ficheiro compat/xp_compat.c escrito mais abaixo.
+          echo "=== [5/10] mbedtls 3.6 (HTTPS/TLS) ==="
+          build_mbedtls() {
+            fetch https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.3/mbedtls-3.6.3.tar.bz2 || return 1
+            cd "$SRC/mbedtls-3.6.3" || return 1
+            run mbedtls python3 scripts/config.py set MBEDTLS_NO_PLATFORM_ENTROPY || return 1
+            run mbedtls python3 scripts/config.py set MBEDTLS_ENTROPY_HARDWARE_ALT || return 1
+            run mbedtls make -j"$JOBS" lib WINDOWS=1 CC="$CC" AR="$AR" CFLAGS="$CPPFLAGS $CFLAGS" || return 1
+            cp -r include/mbedtls include/psa "$PREFIX/include/" || return 1
+            cp library/libmbedtls.a library/libmbedx509.a library/libmbedcrypto.a "$PREFIX/lib/" || return 1
+            printf '%s\n' \
+              "prefix=$PREFIX" \
+              'exec_prefix=${prefix}' \
+              'libdir=${exec_prefix}/lib' \
+              'includedir=${prefix}/include' \
+              '' \
+              'Name: mbedtls' \
+              'Description: mbed TLS' \
+              'Version: 3.6.3' \
+              'Libs: -L${libdir} -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -ladvapi32' \
+              'Cflags: -I${includedir}' \
+              > "$PREFIX/lib/pkgconfig/mbedtls.pc" || return 1
+          }
+          TLS_OK=0
+          if build_mbedtls; then
+            TLS_OK=1
+          else
+            echo "::warning::mbedtls nao compilou; o FFmpeg sera compilado sem TLS (sem HTTPS)"
+          fi
 
           # ---------- [6/10] SDL2 ----------
           echo "=== [6/10] SDL2 (para o ffplay) ==="
@@ -304,9 +321,9 @@ jobs:
           git fetch -q --depth 1 origin "$COMMIT_SHA"
           git checkout -q FETCH_HEAD
 
-          # --- Patch XP: WC_ERR_INVALID_CHARS e Vista+ (no XP o WideCharToMultiByte
+          # --- Patch XP 1: WC_ERR_INVALID_CHARS e Vista+ (no XP o WideCharToMultiByte
           #     com CP_UTF8 so aceita flags == 0) ---
-          echo "::group::Patch XP (WC_ERR_INVALID_CHARS)"
+          echo "::group::Patch XP 1 (WC_ERR_INVALID_CHARS)"
           mapfile -t PFILES < <(grep -rIl --include='*.c' --include='*.h' --include='*.cpp' --include='*.cc' \
                                   -w "WC_ERR_INVALID_CHARS" . || true)
           echo "Ficheiros com WC_ERR_INVALID_CHARS: ${#PFILES[@]}"
@@ -320,6 +337,253 @@ jobs:
             exit 1
           fi
           echo "OK: sem referencias restantes"
+          echo "::endgroup::"
+
+          # --- Patch XP 2: camada de compatibilidade para threads/sincronizacao ---
+          # O compat/w32pthreads.h deste commit usa SRWLock, CONDITION_VARIABLE e
+          # InitOnce (so existem a partir do Vista). Aqui sao fornecidas versoes
+          # proprias, com o prototipo correto, so com APIs que o XP tem.
+          echo "::group::Patch XP 2 (threads / sincronizacao)"
+          cat > compat/xp_compat.h <<'XPEOF'
+          #ifndef XP_COMPAT_H
+          #define XP_COMPAT_H
+          #include <windows.h>
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+          VOID    WINAPI InitializeSRWLock(SRWLOCK *l);
+          VOID    WINAPI AcquireSRWLockExclusive(SRWLOCK *l);
+          VOID    WINAPI ReleaseSRWLockExclusive(SRWLOCK *l);
+          BOOLEAN WINAPI TryAcquireSRWLockExclusive(SRWLOCK *l);
+          VOID    WINAPI InitializeConditionVariable(CONDITION_VARIABLE *c);
+          VOID    WINAPI WakeConditionVariable(CONDITION_VARIABLE *c);
+          VOID    WINAPI WakeAllConditionVariable(CONDITION_VARIABLE *c);
+          BOOL    WINAPI SleepConditionVariableSRW(CONDITION_VARIABLE *c, SRWLOCK *l, DWORD ms, ULONG flags);
+          BOOL    WINAPI InitOnceBeginInitialize(INIT_ONCE *o, DWORD flags, BOOL *pending, LPVOID *ctx);
+          BOOL    WINAPI InitOnceComplete(INIT_ONCE *o, DWORD flags, LPVOID ctx);
+          #ifdef __cplusplus
+          }
+          #endif
+          #endif
+          XPEOF
+
+          cat > compat/xp_compat.c <<'XPEOF'
+          /* Emulacao XP das primitivas Vista+ usadas pelo w32pthreads.h.
+           * Funciona com inicializacao a zero (SRWLOCK_INIT, CONDITION_VARIABLE_INIT,
+           * INIT_ONCE_STATIC_INIT), como as originais. */
+          #include <windows.h>
+          #include <wincrypt.h>
+          #include <stddef.h>
+          #include "xp_compat.h"
+
+          static void xp_backoff(unsigned *n)
+          {
+              unsigned i = (*n)++;
+              if (i < 100)
+                  __asm__ __volatile__("pause" ::: "memory");
+              else if (i < 300)
+                  SwitchToThread();
+              else if (i < 600)
+                  Sleep(0);
+              else
+                  Sleep(1);
+          }
+
+          static void xp_lock(volatile LONG *p)
+          {
+              unsigned n = 0;
+              while (InterlockedCompareExchange(p, 1, 0) != 0) {
+                  while (*p != 0)
+                      xp_backoff(&n);
+              }
+          }
+
+          static void xp_unlock(volatile LONG *p)
+          {
+              InterlockedExchange(p, 0);
+          }
+
+          /* ---- mutex (SRWLOCK exclusivo) ---- */
+          VOID WINAPI InitializeSRWLock(SRWLOCK *l)
+          {
+              l->Ptr = NULL;
+          }
+
+          VOID WINAPI AcquireSRWLockExclusive(SRWLOCK *l)
+          {
+              xp_lock((volatile LONG *)&l->Ptr);
+          }
+
+          VOID WINAPI ReleaseSRWLockExclusive(SRWLOCK *l)
+          {
+              xp_unlock((volatile LONG *)&l->Ptr);
+          }
+
+          BOOLEAN WINAPI TryAcquireSRWLockExclusive(SRWLOCK *l)
+          {
+              return InterlockedCompareExchange((volatile LONG *)&l->Ptr, 1, 0) == 0;
+          }
+
+          /* ---- variaveis de condicao ---- */
+          typedef struct xp_waiter {
+              struct xp_waiter *next;
+              HANDLE ev;
+          } xp_waiter;
+
+          static volatile LONG g_cv_lock = 0;
+
+          VOID WINAPI InitializeConditionVariable(CONDITION_VARIABLE *c)
+          {
+              c->Ptr = NULL;
+          }
+
+          BOOL WINAPI SleepConditionVariableSRW(CONDITION_VARIABLE *c, SRWLOCK *l, DWORD ms, ULONG flags)
+          {
+              xp_waiter w;
+              xp_waiter **head = (xp_waiter **)&c->Ptr;
+              BOOL signaled;
+              DWORD r;
+              (void)flags;
+
+              w.ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+              if (!w.ev)
+                  return FALSE;
+
+              xp_lock(&g_cv_lock);
+              w.next = *head;
+              *head = &w;
+              xp_unlock(&g_cv_lock);
+
+              ReleaseSRWLockExclusive(l);
+              r = WaitForSingleObject(w.ev, ms);
+
+              if (r == WAIT_OBJECT_0) {
+                  signaled = TRUE;
+              } else {
+                  /* timeout: sair da lista se ainda la estiver */
+                  xp_waiter **pp;
+                  xp_lock(&g_cv_lock);
+                  pp = head;
+                  while (*pp && *pp != &w)
+                      pp = &(*pp)->next;
+                  if (*pp == &w) {
+                      *pp = w.next;
+                      signaled = FALSE;
+                  } else {
+                      signaled = TRUE; /* foi sinalizado entretanto */
+                  }
+                  xp_unlock(&g_cv_lock);
+              }
+
+              CloseHandle(w.ev);
+              AcquireSRWLockExclusive(l);
+              if (!signaled)
+                  SetLastError(ERROR_TIMEOUT);
+              return signaled;
+          }
+
+          VOID WINAPI WakeConditionVariable(CONDITION_VARIABLE *c)
+          {
+              xp_waiter **head = (xp_waiter **)&c->Ptr;
+              xp_lock(&g_cv_lock);
+              if (*head) {
+                  xp_waiter **pp = head;
+                  HANDLE ev;
+                  while ((*pp)->next)
+                      pp = &(*pp)->next;
+                  ev = (*pp)->ev;
+                  *pp = NULL;
+                  SetEvent(ev);
+              }
+              xp_unlock(&g_cv_lock);
+          }
+
+          VOID WINAPI WakeAllConditionVariable(CONDITION_VARIABLE *c)
+          {
+              xp_waiter **head = (xp_waiter **)&c->Ptr;
+              xp_waiter *n;
+              xp_lock(&g_cv_lock);
+              n = *head;
+              *head = NULL;
+              while (n) {
+                  xp_waiter *next = n->next;
+                  HANDLE ev = n->ev;
+                  SetEvent(ev);
+                  n = next;
+              }
+              xp_unlock(&g_cv_lock);
+          }
+
+          /* ---- pthread_once (INIT_ONCE): 0 = por fazer, 1 = a correr, 2 = feito ---- */
+          BOOL WINAPI InitOnceBeginInitialize(INIT_ONCE *o, DWORD flags, BOOL *pending, LPVOID *ctx)
+          {
+              volatile LONG *p = (volatile LONG *)&o->Ptr;
+              unsigned n = 0;
+              (void)flags;
+              for (;;) {
+                  LONG s = InterlockedCompareExchange(p, 1, 0);
+                  if (s == 0) {
+                      *pending = TRUE;
+                      return TRUE;
+                  }
+                  if (s == 2) {
+                      *pending = FALSE;
+                      if (ctx)
+                          *ctx = NULL;
+                      return TRUE;
+                  }
+                  xp_backoff(&n);
+              }
+          }
+
+          BOOL WINAPI InitOnceComplete(INIT_ONCE *o, DWORD flags, LPVOID ctx)
+          {
+              (void)ctx;
+              /* 0x4 = INIT_ONCE_INIT_FAILED */
+              InterlockedExchange((volatile LONG *)&o->Ptr, (flags & 0x4) ? 0 : 2);
+              return TRUE;
+          }
+
+          /* ---- entropia para o mbedtls (CryptGenRandom existe no XP) ---- */
+          int mbedtls_hardware_poll(void *data, unsigned char *output, size_t len, size_t *olen)
+          {
+              HCRYPTPROV prov = 0;
+              size_t off = 0;
+              (void)data;
+              *olen = 0;
+              if (!CryptAcquireContextA(&prov, NULL, NULL, PROV_RSA_FULL,
+                                        CRYPT_VERIFYCONTEXT | CRYPT_SILENT))
+                  return -0x003C; /* MBEDTLS_ERR_ENTROPY_SOURCE_FAILED */
+              while (off < len) {
+                  size_t left = len - off;
+                  DWORD chunk = left > 65536 ? 65536 : (DWORD)left;
+                  if (!CryptGenRandom(prov, chunk, output + off)) {
+                      CryptReleaseContext(prov, 0);
+                      return -0x003C;
+                  }
+                  off += chunk;
+              }
+              CryptReleaseContext(prov, 0);
+              *olen = len;
+              return 0;
+          }
+          XPEOF
+
+          if ! grep -q '^#include <windows.h>' compat/w32pthreads.h; then
+            echo "::error::compat/w32pthreads.h nao tem '#include <windows.h>' (estrutura mudou)"
+            sed -n 1,40p compat/w32pthreads.h
+            exit 1
+          fi
+          sed -i '0,/^#include <windows.h>/s//#include <windows.h>\n#include "xp_compat.h"/' compat/w32pthreads.h
+          grep -n 'xp_compat.h' compat/w32pthreads.h
+          if ! grep -q 'xp_compat.h' compat/w32pthreads.h; then
+            echo "::error::Patch do w32pthreads.h nao foi aplicado"
+            exit 1
+          fi
+
+          XP_OBJ="$ROOT/xp_compat.o"
+          run xp_compat "${HOST}-gcc" $CPU_FLAGS $XP_CPPFLAGS -Icompat -c compat/xp_compat.c -o "$XP_OBJ"
+          ls -l "$XP_OBJ"
           echo "::endgroup::"
 
           # --- opcoes opcionais: so se existirem neste fork ---
@@ -350,7 +614,7 @@ jobs:
             --optflags="$CPU_FLAGS"
             --extra-cflags="$FF_CPPFLAGS -I$PREFIX/include"
             --extra-ldflags="$XP_LDFLAGS -L$PREFIX/lib -static -static-libgcc"
-            --extra-libs="-lws2_32 -lwinmm -lgdi32 -lole32 -loleaut32 -limm32 -lversion -luuid -ladvapi32 -lshell32 -lsetupapi -lm"
+            --extra-libs="$XP_OBJ -lws2_32 -lwinmm -lgdi32 -lole32 -loleaut32 -limm32 -lversion -luuid -ladvapi32 -lshell32 -lsetupapi -lm"
             --enable-static --disable-shared
             --enable-gpl --enable-version3
             --enable-w32threads --disable-pthreads
@@ -363,15 +627,27 @@ jobs:
             "${OPT_FLAGS[@]}"
           )
 
-          CONF_LOG="$LOGS/ffmpeg_configure_tls.log"
-          TLS=mbedtls
-          if ! RUN_QUIET=1 run ffmpeg_configure_tls ./configure "${FF_ARGS[@]}" --enable-mbedtls; then
-            echo "::warning::configure com mbedtls falhou; a repetir sem TLS (sem HTTPS)"
-            echo "-------- config.log (ultimas 60 linhas, tentativa com mbedtls) --------"
-            tail -n 60 ffbuild/config.log || true
-            TLS=none
-            CONF_LOG="$LOGS/ffmpeg_configure.log"
-            if ! run ffmpeg_configure ./configure "${FF_ARGS[@]}"; then
+          # $1 = mbedtls | none ; $2 = 1 para nao mostrar o erro
+          do_configure() {
+            local extra=()
+            if [ "$1" = "mbedtls" ]; then
+              extra=(--enable-mbedtls)
+            fi
+            RUN_QUIET="${2:-0}" run "ffmpeg_configure_$1" ./configure "${FF_ARGS[@]}" "${extra[@]}"
+          }
+
+          TLS=none
+          if [ "$TLS_OK" = "1" ]; then
+            if do_configure mbedtls 1; then
+              TLS=mbedtls
+            else
+              echo "::warning::configure com mbedtls falhou; a repetir sem TLS (sem HTTPS)"
+              echo "-------- config.log (ultimas 60 linhas, tentativa com mbedtls) --------"
+              tail -n 60 ffbuild/config.log || true
+            fi
+          fi
+          if [ "$TLS" = "none" ]; then
+            if ! do_configure none 0; then
               echo "-------- config.log (ultimas 80 linhas) --------"
               tail -n 80 ffbuild/config.log || true
               exit 1
@@ -380,11 +656,45 @@ jobs:
           echo "$TLS" > "$META/tls"
           echo "TLS: $TLS"
 
-          sed -n '/^External libraries:/,/^$/p' "$CONF_LOG"
+          sed -n '/^External libraries:/,/^$/p' "$LOGS/ffmpeg_configure_$TLS.log"
           grep -n "WIN32_WINNT" config.h ffbuild/config.mak | cut -c1-240 || true
 
+          # ---------- compilar ----------
           # -k: continua depois do primeiro erro, para listar todos de uma vez
-          run ffmpeg_build make -k -j"$JOBS"
+          QUIET_BUILD=0
+          if [ "$TLS" = "mbedtls" ]; then
+            QUIET_BUILD=1
+          fi
+          if ! RUN_QUIET="$QUIET_BUILD" run ffmpeg_build make -k -j"$JOBS"; then
+            if [ "$TLS" = "mbedtls" ]; then
+              echo "::warning::A compilacao falhou com mbedtls; a repetir sem TLS (sem HTTPS)"
+              echo "-------- erros da tentativa com mbedtls --------"
+              grep -nE "error:|undefined reference|\*\*\*" "$LOGS/ffmpeg_build.log" | cut -c1-300 | sed -n 1,40p || true
+              mv "$LOGS/ffmpeg_build.log" "$LOGS/ffmpeg_build_mbedtls.log"
+              TLS=none
+              echo "$TLS" > "$META/tls"
+              if ! do_configure none 0; then
+                tail -n 80 ffbuild/config.log || true
+                exit 1
+              fi
+              RUN_QUIET=1 run ffmpeg_clean make clean || true
+              run ffmpeg_build make -k -j"$JOBS"
+            else
+              show_fail ffmpeg_build "make -k -j$JOBS"
+              exit 1
+            fi
+          fi
+
+          # ---------- funcoes sem declaracao = chamada errada em runtime ----------
+          IMPL="$(sed -nE "s/.*implicit declaration of function '([A-Za-z0-9_]+)'.*/\1/p" "$LOGS/ffmpeg_build.log" | sort -u || true)"
+          if [ -n "$IMPL" ]; then
+            echo "::error::O codigo chama funcoes sem declaracao (no XP ficariam com convencao de chamada errada):"
+            echo "$IMPL" | sed 's/^/  /'
+            echo "-------- primeiras ocorrencias --------"
+            grep -n "implicit declaration of function" "$LOGS/ffmpeg_build.log" | cut -c1-260 | sed -n 1,25p || true
+            exit 1
+          fi
+          echo "OK: sem chamadas a funcoes sem declaracao"
 
           for b in ffmpeg ffplay ffprobe; do
             if [ ! -f "$b.exe" ]; then
@@ -439,6 +749,10 @@ jobs:
               grep -E 'SubsystemVersion|OSVersion' "$dump" || true
               FAIL=1
             fi
+
+            if [ "$b" != "ffplay" ] && ! grep -q '(Windows CUI)' "$dump"; then
+              echo "::warning::$b.exe nao e uma aplicacao de consola (-mwindows do SDL2?)"
+            fi
             ls -l "$STAGE/$b.exe"
             echo "::endgroup::"
           done
@@ -457,6 +771,7 @@ jobs:
             echo "Tag             : $TAG"
             echo "Variante        : $VARIANT"
             echo "TLS (mbedtls)   : $(cat "$META/tls")"
+            echo "Threads         : w32threads com camada de compatibilidade XP (compat/xp_compat.c)"
             echo "CFLAGS          : $(cat "$META/cpu_flags")"
             echo "GCC             : $("${HOST}-gcc" --version | sed -n 1p)"
             echo
@@ -473,7 +788,7 @@ jobs:
       - name: Guardar zip
         uses: actions/upload-artifact@v4
         with:
-          name: xp_${{ matrix.variant }}
+          name: xp_${{ env.VARIANT }}
           path: ${{ env.ZIP_PATH }}
           if-no-files-found: error
 
@@ -481,7 +796,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: logs_${{ matrix.variant }}
+          name: logs_${{ env.VARIANT }}
           path: build/logs
           if-no-files-found: ignore
 
@@ -532,12 +847,13 @@ jobs:
             echo "| \`prescott\` | Pentium 4 Prescott (SSE3) | \`-O2 -march=prescott -mtune=prescott -mfpmath=sse\` |"
             echo
             echo "Binarios estaticos e sem simbolos (\`strip\`), validados para nao importarem DLLs/funcoes Vista+."
+            echo "As primitivas de sincronizacao Vista+ do codigo do FFmpeg foram substituidas por uma camada de compatibilidade XP."
             echo
             echo "### Incluido"
             echo
             echo "ffmpeg.exe, ffplay.exe (SDL2), ffprobe.exe"
             echo
-            echo "Codecs internos + libx264, libmp3lame, libvorbis, libopus, zlib, bzip2, lzma, iconv e HTTPS via mbedtls (ver \`BUILD-INFO.txt\`)."
+            echo "Codecs internos + libx264, libmp3lame, libvorbis, libopus, zlib, bzip2, lzma, iconv e, se compilou, HTTPS via mbedtls (ver \`BUILD-INFO.txt\`)."
             echo
             echo "### Commit upstream"
             echo
