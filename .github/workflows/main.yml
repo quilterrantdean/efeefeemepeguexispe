@@ -27,6 +27,7 @@ concurrency:
 
 env:
   UPSTREAM: sherpya/ffmpeg
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   check:
@@ -106,6 +107,15 @@ jobs:
           REL="$WORKDIR/release"
           mkdir -p "$SRC" "$PREFIX/include" "$PREFIX/lib/pkgconfig" "$PREFIX/bin" "$LOGS" "$REL"
 
+          # Em caso de erro em qualquer passo, imprime automaticamente o ultimo log na consola
+          trap '
+            echo "::error::Falha na compilacao! Ultimas linhas dos logs:"
+            for f in $(ls -t "$LOGS"/*.log 2>/dev/null | head -n 2); do
+              echo "==================== $f ===================="
+              tail -n 100 "$f" || true
+            done
+          ' ERR
+
           export PATH="$PREFIX/bin:$PATH"
           export PKG_CONFIG_DIR=""
           export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig"
@@ -119,11 +129,11 @@ jobs:
           if [ "$VARIANT" = "prescott" ]; then
             # Pentium 4 HT Prescott (NetBurst): -O2 + vectorizacao evita saturar a Trace Cache (12K uOps),
             # enquanto -msse3 e -mfpmath=sse usam os registos SSE3 em vez da lenta FPU x87.
-            CPU_FLAGS="-O2 -ftree-vectorize -march=prescott -mtune=prescott -msse3 -mfpmath=sse -fomit-frame-pointer -ffunction-sections -fdata-sections"
+            CPU_FLAGS="-O2 -ftree-vectorize -march=prescott -mtune=prescott -msse3 -mfpmath=sse -fomit-frame-pointer -ffunction-sections -fdata-sections -Wno-error"
             FF_CPU="prescott"
           else
             # i686 generico sem SSE obrigatorio no codigo C (mantem deteccao de CPU em runtime para Assembly)
-            CPU_FLAGS="-O2 -march=i686 -mtune=generic -fomit-frame-pointer -ffunction-sections -fdata-sections"
+            CPU_FLAGS="-O2 -march=i686 -mtune=generic -fomit-frame-pointer -ffunction-sections -fdata-sections -Wno-error"
             FF_CPU="i686"
           fi
 
@@ -184,6 +194,7 @@ jobs:
           Libs: -L\${libdir} -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -lcrypt32 -ladvapi32
           Cflags: -I\${includedir}
           EOF
+          sed -i 's/^[[:space:]]*//' "$PREFIX/lib/pkgconfig/mbedtls.pc"
 
           echo "=== [6/11] SDL2 (necessario para ffplay.exe; Direct3D9/OpenGL/DirectSound) ==="
           cd "$SRC"
@@ -231,8 +242,12 @@ jobs:
           cd "$SRC"
           curl -fsSL https://downloads.xvid.com/downloads/xvidcore-1.3.7.tar.gz | tar -xz
           cd xvidcore/build/generic
-          ./configure --host=i686-w64-mingw32 --prefix="$PREFIX" >"$LOGS/xvid.log" 2>&1
-          make -j"$JOBS" >>"$LOGS/xvid.log" 2>&1
+          # Remove -mno-cygwin (removido no GCC moderno) e desactiva build da DLL partilhada
+          sed -i 's/-mno-cygwin//g' configure
+          ./configure --build=x86_64-pc-linux-gnu --host=i686-w64-mingw32 --prefix="$PREFIX" >"$LOGS/xvid.log" 2>&1
+          sed -i 's/^SHARED_LIB.*/SHARED_LIB=/' platform.inc
+          # Makefile do xvidcore nao suporta -j paralelo (race condition a criar a diretoria =build)
+          make -j1 >>"$LOGS/xvid.log" 2>&1
           make install >>"$LOGS/xvid.log" 2>&1
           [ -f "$PREFIX/lib/xvidcore.a" ] && mv -f "$PREFIX/lib/xvidcore.a" "$PREFIX/lib/libxvidcore.a"
           rm -f "$PREFIX/lib/xvidcore.dll"* "$PREFIX/bin/xvidcore.dll"
@@ -254,6 +269,123 @@ jobs:
           git fetch --depth 1 origin "$COMMIT_SHA"
           git checkout FETCH_HEAD
 
+          # Impede o configure do FFmpeg de subir _WIN32_WINNT para 0x0600 (Vista+)
+          sed -i 's/_WIN32_WINNT >= 0x060[0-9]/_WIN32_WINNT >= 0x0501/g' configure
+          sed -i 's/-D_WIN32_WINNT=0x060[0-9]/-D_WIN32_WINNT=0x0501/g' configure
+
+          # Se compat/w32pthreads.h usar SRWLOCK/CONDITION_VARIABLE/INIT_ONCE (APIs Vista+),
+          # injecta implementacao leve compativel com Windows XP (baseada em CRITICAL_SECTION e Semaphore)
+          if [ -f compat/w32pthreads.h ] && ! grep -q "FF_XP_SYNC_FALLBACK" compat/w32pthreads.h; then
+            cat > compat/xp_sync_fallback.h << 'XPEOF'
+          #ifndef FF_XP_SYNC_FALLBACK
+          #define FF_XP_SYNC_FALLBACK
+          #include <windows.h>
+          #if _WIN32_WINNT < 0x0600
+
+          #ifndef SRWLOCK_INIT
+          typedef struct _XP_SRWLOCK { PVOID Ptr; } SRWLOCK, *PSRWLOCK;
+          #define SRWLOCK_INIT {0}
+          #endif
+          #ifndef CONDITION_VARIABLE_INIT
+          typedef struct _XP_CONDITION_VARIABLE { PVOID Ptr; } CONDITION_VARIABLE, *PCONDITION_VARIABLE;
+          #define CONDITION_VARIABLE_INIT {0}
+          #endif
+          #ifndef INIT_ONCE_STATIC_INIT
+          typedef union _XP_INIT_ONCE { PVOID Ptr; } INIT_ONCE, *PINIT_ONCE, *LPINIT_ONCE;
+          #define INIT_ONCE_STATIC_INIT {0}
+          typedef BOOL (WINAPI *PINIT_ONCE_FN)(PINIT_ONCE, PVOID, PVOID*);
+          #endif
+
+          static inline CRITICAL_SECTION* ff_xp_srw_cs(PSRWLOCK lock) {
+              CRITICAL_SECTION *cs = (CRITICAL_SECTION*)lock->Ptr;
+              if (!cs) {
+                  CRITICAL_SECTION *ncs = (CRITICAL_SECTION*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(CRITICAL_SECTION));
+                  InitializeCriticalSection(ncs);
+                  if (InterlockedCompareExchangePointer(&lock->Ptr, ncs, NULL) != NULL) {
+                      DeleteCriticalSection(ncs);
+                      HeapFree(GetProcessHeap(), 0, ncs);
+                  }
+                  cs = (CRITICAL_SECTION*)lock->Ptr;
+              }
+              return cs;
+          }
+          static inline void InitializeSRWLock(PSRWLOCK lock) { lock->Ptr = NULL; }
+          static inline void AcquireSRWLockExclusive(PSRWLOCK lock) { EnterCriticalSection(ff_xp_srw_cs(lock)); }
+          static inline void ReleaseSRWLockExclusive(PSRWLOCK lock) { LeaveCriticalSection(ff_xp_srw_cs(lock)); }
+          static inline BOOLEAN TryAcquireSRWLockExclusive(PSRWLOCK lock) { return TryEnterCriticalSection(ff_xp_srw_cs(lock)); }
+          static inline void AcquireSRWLockShared(PSRWLOCK lock) { EnterCriticalSection(ff_xp_srw_cs(lock)); }
+          static inline void ReleaseSRWLockShared(PSRWLOCK lock) { LeaveCriticalSection(ff_xp_srw_cs(lock)); }
+          static inline BOOLEAN TryAcquireSRWLockShared(PSRWLOCK lock) { return TryEnterCriticalSection(ff_xp_srw_cs(lock)); }
+
+          typedef struct { CRITICAL_SECTION cs; HANDLE sem; LONG waiters; } ff_xp_cv_t;
+          static inline ff_xp_cv_t* ff_xp_cv_get(PCONDITION_VARIABLE cv) {
+              ff_xp_cv_t *c = (ff_xp_cv_t*)cv->Ptr;
+              if (!c) {
+                  ff_xp_cv_t *nc = (ff_xp_cv_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(ff_xp_cv_t));
+                  InitializeCriticalSection(&nc->cs);
+                  nc->sem = CreateSemaphoreW(NULL, 0, 0x7fffffff, NULL);
+                  nc->waiters = 0;
+                  if (InterlockedCompareExchangePointer(&cv->Ptr, nc, NULL) != NULL) {
+                      CloseHandle(nc->sem);
+                      DeleteCriticalSection(&nc->cs);
+                      HeapFree(GetProcessHeap(), 0, nc);
+                  }
+                  c = (ff_xp_cv_t*)cv->Ptr;
+              }
+              return c;
+          }
+          static inline void InitializeConditionVariable(PCONDITION_VARIABLE cv) { cv->Ptr = NULL; }
+          static inline BOOL SleepConditionVariableCS(PCONDITION_VARIABLE cv, PCRITICAL_SECTION cs, DWORD ms) {
+              ff_xp_cv_t *c = ff_xp_cv_get(cv);
+              EnterCriticalSection(&c->cs);
+              c->waiters++;
+              LeaveCriticalSection(&c->cs);
+              LeaveCriticalSection(cs);
+              DWORD r = WaitForSingleObject(c->sem, ms);
+              if (r != WAIT_OBJECT_0) {
+                  EnterCriticalSection(&c->cs);
+                  if (c->waiters > 0) c->waiters--;
+                  LeaveCriticalSection(&c->cs);
+              }
+              EnterCriticalSection(cs);
+              if (r != WAIT_OBJECT_0) { SetLastError(ERROR_TIMEOUT); return FALSE; }
+              return TRUE;
+          }
+          static inline BOOL SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK lock, DWORD ms, ULONG flags) {
+              (void)flags;
+              return SleepConditionVariableCS(cv, ff_xp_srw_cs(lock), ms);
+          }
+          static inline void WakeConditionVariable(PCONDITION_VARIABLE cv) {
+              ff_xp_cv_t *c = ff_xp_cv_get(cv);
+              EnterCriticalSection(&c->cs);
+              if (c->waiters > 0) { c->waiters--; ReleaseSemaphore(c->sem, 1, NULL); }
+              LeaveCriticalSection(&c->cs);
+          }
+          static inline void WakeAllConditionVariable(PCONDITION_VARIABLE cv) {
+              ff_xp_cv_t *c = ff_xp_cv_get(cv);
+              EnterCriticalSection(&c->cs);
+              if (c->waiters > 0) { ReleaseSemaphore(c->sem, c->waiters, NULL); c->waiters = 0; }
+              LeaveCriticalSection(&c->cs);
+          }
+          static inline BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *ctx) {
+              for (;;) {
+                  LONG state = (LONG)(INT_PTR)InterlockedCompareExchangePointer(&once->Ptr, (PVOID)1, (PVOID)0);
+                  if (state == 0) {
+                      fn(once, param, ctx);
+                      InterlockedExchangePointer(&once->Ptr, (PVOID)2);
+                      return TRUE;
+                  }
+                  if (state == 2) return TRUE;
+                  Sleep(0);
+              }
+          }
+          #endif /* _WIN32_WINNT < 0x0600 */
+          #endif /* FF_XP_SYNC_FALLBACK */
+          XPEOF
+            sed -i 's/^[[:space:]]*//' compat/xp_sync_fallback.h
+            sed -i '/#include <windows.h>/a #include "xp_sync_fallback.h"' compat/w32pthreads.h
+          fi
+
           # Garante que nas diferentes revisoes do sherpya/ffmpeg apenas passamos flags suportadas
           EXTRA_FF_FLAGS=()
           for opt in \
@@ -263,8 +395,11 @@ jobs:
             --disable-d3d12va \
             --disable-dxva2 \
             --disable-vulkan \
-            --disable-schannel; do
-            if ./configure --help | grep -q -- "$opt"; then
+            --disable-schannel \
+            --disable-indev=wasapi \
+            --disable-outdev=wasapi; do
+            base_opt="${opt%%=*}"
+            if ./configure --help | grep -q -- "$base_opt"; then
               EXTRA_FF_FLAGS+=("$opt")
             fi
           done
@@ -308,7 +443,7 @@ jobs:
             --enable-libxvid \
             "${EXTRA_FF_FLAGS[@]}" >"$LOGS/ffmpeg_configure.log" 2>&1 || {
               cat "$LOGS/ffmpeg_configure.log"
-              [ -f ffbuild/config.log ] && cp ffbuild/config.log "$LOGS/" && tail -n 100 ffbuild/config.log
+              [ -f ffbuild/config.log ] && cp ffbuild/config.log "$LOGS/" && tail -n 120 ffbuild/config.log
               exit 1
             }
 
@@ -325,12 +460,18 @@ jobs:
             fi
             i686-w64-mingw32-strip --strip-all "$PREFIX/bin/$bin" -o "$STAGE/$bin"
 
-            # Verifica que nenhuma DLL exclusiva do Vista+ ou pthread externa foi ligada
-            dlls=$(i686-w64-mingw32-objdump -p "$STAGE/$bin" | awk '/DLL Name:/{print $3}')
+            # Verifica que nenhuma DLL ou simbolo exclusivo do Vista+ foi importado
+            dump=$(i686-w64-mingw32-objdump -p "$STAGE/$bin")
+            dlls=$(echo "$dump" | awk '/DLL Name:/{print $3}')
             echo "DLLs importadas por $bin:"
             echo "$dlls"
             if echo "$dlls" | grep -Eqi '^(bcrypt|ncrypt|mfplat|d3d11|dxva2|libwinpthread).*\.dll$'; then
               echo "::error::$bin importa DLL incompativel com Windows XP!"
+              exit 1
+            fi
+            if echo "$dump" | grep -Eq '\b(InitializeSRWLock|SleepConditionVariableSRW|InitOnceExecuteOnce|GetTickCount64|WSAPoll|inet_pton|BCryptGenRandom)\b'; then
+              echo "::error::$bin importa funcoes de API exclusivas do Windows Vista+!"
+              echo "$dump" | grep -E '\b(InitializeSRWLock|SleepConditionVariableSRW|InitOnceExecuteOnce|GetTickCount64|WSAPoll|inet_pton|BCryptGenRandom)\b'
               exit 1
             fi
           done
