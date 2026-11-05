@@ -1,4 +1,103 @@
-- name: Configurar e Compilar
+name: FFmpeg Sherpya XP
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      commit_ref:
+        description: "Commit SHA ou ramo a compilar (vazio = master)"
+        required: false
+        default: ""
+      force:
+        description: "Recompilar mesmo que a release ja exista"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ffmpeg-sherpya-xp
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: sherpya/FFmpeg
+
+jobs:
+  check:
+    name: Verificar commits upstream
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.up.outputs.tag }}
+      sha: ${{ steps.up.outputs.sha }}
+      build: ${{ steps.up.outputs.build }}
+      date: ${{ steps.up.outputs.date }}
+      msg: ${{ steps.up.outputs.msg }}
+    steps:
+      - id: up
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.commit_ref }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          ref="${INPUT_REF:-master}"
+          commit_json=$(gh api "repos/$UPSTREAM/commits/$ref")
+          sha=$(echo "$commit_json" | jq -r '.sha')
+          short_sha="${sha:0:7}"
+          commit_date=$(echo "$commit_json" | jq -r '.commit.committer.date' | cut -d'T' -f1 | tr -d '-')
+          commit_msg=$(echo "$commit_json" | jq -r '.commit.message' | head -n1)
+
+          tag="snapshot-${commit_date}-${short_sha}"
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "$FORCE" != "true" ]; then
+            build=false
+            echo "Release $tag ja existe em $GITHUB_REPOSITORY; nada a fazer."
+          else
+            build=true
+            echo "A compilar commit $sha com a tag $tag."
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "date=$commit_date" >> "$GITHUB_OUTPUT"
+          echo "msg=$commit_msg" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Compilar (${{ matrix.variant }})
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        variant: [prescott, generic]
+    steps:
+      - name: Instalar dependencias de compilacao
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mingw-w64-i686-posix g++-mingw-w64-i686-posix binutils-mingw-w64-i686 \
+            mingw-w64-i686-dev make git curl ca-certificates xz-utils zip yasm nasm pkg-config
+
+      - name: Instalar SDL2 para ffplay (compativel com XP)
+        run: |
+          curl -sLO https://github.com/libsdl-org/SDL/releases/download/release-2.28.5/SDL2-devel-2.28.5-mingw.tar.gz
+          tar -xzf SDL2-devel-2.28.5-mingw.tar.gz
+          sudo cp -r SDL2-2.28.5/i686-w64-mingw32/* /usr/i686-w64-mingw32/
+          sudo sed -i 's|/opt/local/i686-w64-mingw32|/usr/i686-w64-mingw32|g' /usr/i686-w64-mingw32/bin/sdl2-config
+          sudo sed -i 's|/opt/local/i686-w64-mingw32|/usr/i686-w64-mingw32|g' /usr/i686-w64-mingw32/lib/pkgconfig/sdl2.pc
+          sudo cp /usr/i686-w64-mingw32/bin/sdl2-config /usr/local/bin/i686-w64-mingw32-sdl2-config
+
+      - name: Obter codigo de sherpya/FFmpeg
+        run: |
+          git clone "https://github.com/${{ env.UPSTREAM }}.git" ffmpeg
+          cd ffmpeg
+          git checkout ${{ needs.check.outputs.sha }}
+
+      - name: Configurar e Compilar
         id: compile
         run: |
           set -euo pipefail
@@ -49,3 +148,72 @@
           mkdir -p ../out
           cp ffmpeg.exe ffprobe.exe ffplay.exe ../out/
           cp /usr/i686-w64-mingw32/bin/SDL2.dll ../out/
+
+      - name: Empacotar ZIP
+        run: |
+          set -euo pipefail
+          mkdir -p pkg
+          ZIP_NAME="ffmpeg-${{ needs.check.outputs.tag }}-xp_${{ matrix.variant }}.zip"
+          (cd out && zip -9 "../pkg/${ZIP_NAME}" ffmpeg.exe ffprobe.exe ffplay.exe SDL2.dll)
+
+      - name: Guardar pacote
+        uses: actions/upload-artifact@v4
+        with:
+          name: xp_${{ matrix.variant }}
+          path: pkg/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Publicar release
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: xp_*
+          path: dist
+          merge-multiple: true
+
+      - name: Criar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+          SHA: ${{ needs.check.outputs.sha }}
+          DATE: ${{ needs.check.outputs.date }}
+          MSG: ${{ needs.check.outputs.msg }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          url="https://github.com/${UPSTREAM}/commit/${SHA}"
+
+          {
+            echo "> **Compilação estática não oficial para Windows XP (32 bits)** de [\`${UPSTREAM}\`](${url})."
+            echo "> Commit: \`${SHA}\` (${DATE}) — *\"${MSG}\"*"
+            echo "> Inclui os patches de Gianluigi Tiesi (Sherpya) com recursos e ícones Win32 nativos."
+            echo ">"
+            echo "> | Ficheiro | Arquitectura / Optimização |"
+            echo "> |---|---|"
+            echo "> | \`ffmpeg-${TAG}-xp_prescott.zip\` | Pentium 4 Prescott (\`--cpu=prescott\`, SSE3, \`-mfpmath=sse\`) |"
+            echo "> | \`ffmpeg-${TAG}-xp_generic.zip\` | Genérica x86 (\`--cpu=i686\`, runtime-cpudetect) |"
+            echo ">"
+            echo "> Conteúdo de cada arquivo ZIP:"
+            echo "> - \`ffmpeg.exe\` (linha de comandos)"
+            echo "> - \`ffprobe.exe\` (análise de média)"
+            echo "> - \`ffplay.exe\` (reprodutor de vídeo/áudio via SDL2)"
+            echo "> - \`SDL2.dll\` (biblioteca necessária para a execução do ffplay)"
+            echo ">"
+            echo "> Subsistema PE forçado a 5.01 (compatibilidade nativa com Windows XP SP2/SP3 sem erros de DLL ausente)."
+          } > notes.md
+
+          (cd dist && sha256sum ./*.zip | sed 's| \./| |' > SHA256SUMS && cat SHA256SUMS)
+
+          if [ "${FORCE:-}" = "true" ]; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          fi
+
+          gh release create "$TAG" dist/*.zip dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "FFmpeg XP (${TAG})" \
+            --notes-file notes.md \
+            --latest=true
