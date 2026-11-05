@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       commit:
-        description: "Commit/branch/tag do sherpya/ffmpeg (vazio = ultimo commit da branch principal)"
+        description: "Commit/branch/tag do sherpya/ffmpeg (vazio = ultimo commit do branch por defeito)"
         required: false
         default: ""
         type: string
@@ -25,78 +25,76 @@ concurrency:
 
 env:
   UPSTREAM: sherpya/ffmpeg
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # 1) CHECK: descobre o commit e decide se e preciso compilar
-  # ---------------------------------------------------------------------------
-  check:
-    runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.r.outputs.tag }}
-      sha: ${{ steps.r.outputs.sha }}
-      build: ${{ steps.r.outputs.build }}
-    steps:
-      - name: Resolver commit e verificar se a release ja existe
-        id: r
-        env:
-          GH_TOKEN: ${{ github.token }}
-          INPUT_COMMIT: ${{ inputs.commit }}
-          INPUT_FORCE: ${{ inputs.force }}
-        run: |
-          set -euo pipefail
-
-          ref="${INPUT_COMMIT:-}"
-          if [ -z "$ref" ]; then
-            ref="$(gh api "repos/$UPSTREAM" --jq .default_branch)"
-          fi
-          if ! [[ "$ref" =~ ^[A-Za-z0-9._/-]+$ ]]; then
-            echo "::error::Valor invalido em 'commit': $ref"
-            exit 1
-          fi
-
-          json="$(gh api "repos/$UPSTREAM/commits/$ref")"
-          sha="$(jq -r .sha <<<"$json")"
-          cdate="$(jq -r .commit.committer.date <<<"$json")"
-          day="$(date -u -d "$cdate" +%Y%m%d)"
-          tag="git-${day}-${sha:0:7}"
-
-          build=true
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            if [ "${INPUT_FORCE:-false}" != "true" ]; then
-              build=false
-            fi
-          fi
-
-          echo "ref=$ref  sha=$sha  tag=$tag  build=$build"
-          {
-            echo "tag=$tag"
-            echo "sha=$sha"
-            echo "build=$build"
-          } >> "$GITHUB_OUTPUT"
-
-  # ---------------------------------------------------------------------------
-  # 2) BUILD: cross-compilacao MinGW-w64 (i686) para Windows XP
-  # ---------------------------------------------------------------------------
   build:
-    needs: check
-    if: needs.check.outputs.build == 'true'
+    name: FFmpeg XP
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
       ROOT: ${{ github.workspace }}/build
       HOST: i686-w64-mingw32
-      # para voltar a ter a variante generica, muda para "generic"
-      # (o ramo existe no script) ou volta a usar uma matrix
+      # prescott = otimizado para Pentium 4 Prescott | generic = qualquer CPU i686
       VARIANT: prescott
-      TAG: ${{ needs.check.outputs.tag }}
-      COMMIT_SHA: ${{ needs.check.outputs.sha }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
-      - name: Instalar ferramentas
+      # ------------------------------------------------------------------
+      # 1) VERIFICAR
+      # ------------------------------------------------------------------
+      - name: "1) Verificar se ha commit novo"
+        id: check
+        shell: bash
+        env:
+          INPUT_COMMIT: ${{ inputs.commit }}
+          INPUT_FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
-          sudo apt-get update -y
+          default_branch="$(gh api "repos/$UPSTREAM" --jq .default_branch)"
+          ref="${INPUT_COMMIT:-}"
+          if [ -z "$ref" ]; then ref="$default_branch"; fi
+          if ! [[ "$ref" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::Valor invalido em 'commit': $ref"
+            exit 1
+          fi
+          info="$(gh api "repos/$UPSTREAM/commits/$ref")"
+          sha="$(jq -r .sha <<<"$info")"
+          cdate="$(jq -r .commit.committer.date <<<"$info")"
+          head_sha="$(gh api "repos/$UPSTREAM/commits/$default_branch" --jq .sha)"
+          day="$(date -u -d "$cdate" +%Y%m%d)"
+          tag="git-${day}-${sha:0:7}"
+
+          build=true
+          if [ "${INPUT_FORCE:-false}" != "true" ] && gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            build=false
+          fi
+
+          echo "Upstream ref : $ref"
+          echo "Commit       : $sha"
+          echo "Tag          : $tag"
+          echo "Compilar     : $build"
+          {
+            echo "tag=$tag"
+            echo "sha=$sha"
+            echo "head=$head_sha"
+            echo "build=$build"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: "Nada a fazer"
+        if: steps.check.outputs.build != 'true'
+        run: |
+          echo "::notice::A release ${{ steps.check.outputs.tag }} ja existe. Usa 'force' para recompilar."
+
+      # ------------------------------------------------------------------
+      # 2) FERRAMENTAS
+      # ------------------------------------------------------------------
+      - name: "2) Instalar ferramentas"
+        if: steps.check.outputs.build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-mingw-w64-i686-win32 g++-mingw-w64-i686-win32 \
             binutils-mingw-w64-i686 mingw-w64-i686-dev \
@@ -105,52 +103,61 @@ jobs:
           sudo update-alternatives --set i686-w64-mingw32-gcc /usr/bin/i686-w64-mingw32-gcc-win32 || true
           sudo update-alternatives --set i686-w64-mingw32-g++ /usr/bin/i686-w64-mingw32-g++-win32 || true
           i686-w64-mingw32-gcc --version | sed -n 1p
+          nasm -v
 
-      - name: Compilar dependencias e FFmpeg
+      # ------------------------------------------------------------------
+      # 3) COMPILAR
+      # ------------------------------------------------------------------
+      - name: "3) Compilar dependencias e FFmpeg"
+        if: steps.check.outputs.build == 'true'
+        shell: bash
+        env:
+          TAG: ${{ steps.check.outputs.tag }}
+          COMMIT_SHA: ${{ steps.check.outputs.sha }}
         run: |
           set -euo pipefail
-          export LC_ALL=C   # mensagens do compilador em ASCII (para o filtro de erros)
+          export LC_ALL=C
 
           SRC="$ROOT/src"
           PREFIX="$ROOT/prefix"
           LOGS="$ROOT/logs"
           META="$ROOT/meta"
           JOBS="$(nproc)"
-          mkdir -p "$SRC" "$PREFIX/bin" "$PREFIX/include" "$PREFIX/lib/pkgconfig" "$LOGS" "$META"
+          mkdir -p "$SRC" "$PREFIX/lib/pkgconfig" "$PREFIX/include" "$PREFIX/bin" "$LOGS" "$META"
 
-          # ---------- funcoes auxiliares ----------
+          # ---------------- helpers ----------------
           show_fail() {
-            local name="$1"; shift
-            echo "::error::Falhou [$name]: $*"
-            echo "-------- erros encontrados em $name.log --------"
-            grep -nE "error:|Error [0-9]+|undefined reference|No such file|\*\*\*" "$LOGS/$name.log" | cut -c1-300 | sed -n 1,60p || true
-            echo "-------- ultimas 150 linhas de $name.log --------"
-            tail -n 150 "$LOGS/$name.log"
+            local name="$1"
+            echo "::error::Falhou: $name"
+            echo "---- linhas relevantes de $name ----"
+            grep -E 'error:|Error [0-9]+|undefined reference|No such file|\*\*\*' "$LOGS/$name.log" 2>/dev/null | head -n 60 || true
+            echo "---- fim ----"
           }
 
+          # corre um comando, mostra o output na consola e guarda no log
           run() {
             local name="$1"; shift
-            echo "+ $*" >> "$LOGS/$name.log"
-            if "$@" >> "$LOGS/$name.log" 2>&1; then
-              return 0
+            local rc
+            set +e
+            "$@" 2>&1 | tee -a "$LOGS/$name.log"
+            rc=${PIPESTATUS[0]}
+            set -e
+            if [ "$rc" -ne 0 ] && [ "${RUN_QUIET:-0}" != "1" ]; then
+              show_fail "$name"
             fi
-            if [ "${RUN_QUIET:-0}" != "1" ]; then
-              show_fail "$name" "$@"
-            fi
-            return 1
+            return "$rc"
           }
 
           fetch() {
-            local url="$1" f
-            f="$(mktemp -p "$ROOT")"
-            curl -fL -sS --retry 5 --retry-delay 3 --retry-all-errors -o "$f" "$url" || { rm -f "$f"; return 1; }
-            tar -xf "$f" -C "$SRC" || { rm -f "$f"; return 1; }
+            local url="$1" f="$ROOT/dl.tmp"
+            rm -f "$f"
+            curl -fL --retry 5 --retry-delay 3 --retry-all-errors -sS -o "$f" "$url" || return 1
+            tar -xf "$f" -C "$SRC" || return 1
             rm -f "$f"
           }
 
-          # ---------- flags XP + CPU ----------
+          # ---------------- flags ----------------
           XP_CPPFLAGS="-D_WIN32_WINNT=0x0501 -DWINVER=0x0501 -DNDEBUG"
-          # para o FFmpeg: -U antes do -D evita os avisos "_WIN32_WINNT redefined"
           FF_CPPFLAGS="-U_WIN32_WINNT -UWINVER -D_WIN32_WINNT=0x0501 -DWINVER=0x0501 -DNDEBUG"
           XP_LDFLAGS="-Wl,--major-os-version=5 -Wl,--minor-os-version=1 -Wl,--major-subsystem-version=5 -Wl,--minor-subsystem-version=1 -Wl,--gc-sections"
 
@@ -164,218 +171,257 @@ jobs:
               FF_CPU=i686
               ;;
             *)
-              echo "::error::Variante desconhecida: $VARIANT"
+              echo "::error::VARIANT invalida: $VARIANT"
               exit 1
               ;;
           esac
           echo "$CPU_FLAGS" > "$META/cpu_flags"
           echo "Variante: $VARIANT"
-          echo "CPU_FLAGS: $CPU_FLAGS"
+          echo "CFLAGS  : $CPU_FLAGS"
 
           export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
           export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
-
           export CC="${HOST}-gcc" CXX="${HOST}-g++" AR="${HOST}-ar" RANLIB="${HOST}-ranlib"
           export STRIP="${HOST}-strip" WINDRES="${HOST}-windres" DLLTOOL="${HOST}-dlltool"
           export CPPFLAGS="$XP_CPPFLAGS -I$PREFIX/include"
-          export CFLAGS="$CPU_FLAGS"
-          export CXXFLAGS="$CPU_FLAGS"
+          export CFLAGS="$CPU_FLAGS" CXXFLAGS="$CPU_FLAGS"
           export LDFLAGS="-L$PREFIX/lib"
 
-          # ---------- [1/10] zlib ----------
-          echo "=== [1/10] zlib ==="
+          # ======================================================
+          # Dependencias (todas estaticas)
+          # ======================================================
+          echo "::group::zlib 1.3.1"
           fetch https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.xz
           cd "$SRC/zlib-1.3.1"
           run zlib make -f win32/Makefile.gcc PREFIX="${HOST}-" SHARED_MODE=0 \
             LOC="$CPPFLAGS $CFLAGS" \
             BINARY_PATH="$PREFIX/bin" INCLUDE_PATH="$PREFIX/include" LIBRARY_PATH="$PREFIX/lib" install
+          echo "::endgroup::"
 
-          # ---------- [2/10] bzip2 ----------
-          echo "=== [2/10] bzip2 ==="
+          echo "::group::bzip2 1.0.8"
           fetch https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz
           cd "$SRC/bzip2-1.0.8"
-          run bzip2 make -j"$JOBS" libbz2.a CC="$CC" AR="$AR" RANLIB="$RANLIB" \
-            CFLAGS="$CPPFLAGS $CFLAGS -D_FILE_OFFSET_BITS=64"
+          run bzip2 make libbz2.a CC="$CC" AR="$AR" RANLIB="$RANLIB" CFLAGS="$CPPFLAGS $CFLAGS -D_FILE_OFFSET_BITS=64"
           cp bzlib.h "$PREFIX/include/"
           cp libbz2.a "$PREFIX/lib/"
+          echo "::endgroup::"
 
-          # ---------- [3/10] xz / liblzma ----------
-          echo "=== [3/10] xz / liblzma ==="
+          echo "::group::xz 5.4.7"
           fetch https://github.com/tukaani-project/xz/releases/download/v5.4.7/xz-5.4.7.tar.xz
           cd "$SRC/xz-5.4.7"
-          run xz ./configure --host="$HOST" --prefix="$PREFIX" \
-            --disable-shared --enable-static \
+          run xz ./configure --host="$HOST" --prefix="$PREFIX" --disable-shared --enable-static \
             --disable-xz --disable-xzdec --disable-lzmadec --disable-lzmainfo \
             --disable-scripts --disable-doc --disable-nls --enable-threads=win95
           run xz make -j"$JOBS"
           run xz make install
+          echo "::endgroup::"
 
-          # ---------- [4/10] libiconv ----------
-          echo "=== [4/10] libiconv ==="
+          echo "::group::libiconv 1.17"
           fetch https://ftp.gnu.org/pub/gnu/libiconv/libiconv-1.17.tar.gz
           cd "$SRC/libiconv-1.17"
-          run iconv ./configure --host="$HOST" --prefix="$PREFIX" \
-            --disable-shared --enable-static --disable-nls
+          run iconv ./configure --host="$HOST" --prefix="$PREFIX" --disable-shared --enable-static --disable-nls
           run iconv make -j"$JOBS"
           run iconv make install
+          echo "::endgroup::"
 
-          # ---------- [5/10] mbedtls 3.6 ----------
-          # Nao e fatal: se falhar, o FFmpeg e compilado sem TLS (sem HTTPS).
-          # A fonte de entropia nativa (BCryptGenRandom) nao existe no XP; e
-          # substituida por mbedtls_hardware_poll (CryptGenRandom), que fica
-          # no ficheiro compat/xp_compat.c escrito mais abaixo.
-          echo "=== [5/10] mbedtls 3.6 (HTTPS/TLS) ==="
+          # ---- mbedtls 3.6.3 (opcional: se falhar, compila-se sem TLS) ----
+          TLS_OK=0
           build_mbedtls() {
             fetch https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.3/mbedtls-3.6.3.tar.bz2 || return 1
             cd "$SRC/mbedtls-3.6.3" || return 1
-            run mbedtls python3 scripts/config.py set MBEDTLS_NO_PLATFORM_ENTROPY || return 1
-            run mbedtls python3 scripts/config.py set MBEDTLS_ENTROPY_HARDWARE_ALT || return 1
-            run mbedtls make -j"$JOBS" lib WINDOWS=1 CC="$CC" AR="$AR" CFLAGS="$CPPFLAGS $CFLAGS" || return 1
+            # BCryptGenRandom nao existe no XP: entropia propria via CryptGenRandom
+            python3 scripts/config.py set MBEDTLS_NO_PLATFORM_ENTROPY || return 1
+            python3 scripts/config.py set MBEDTLS_ENTROPY_HARDWARE_ALT || return 1
+            cat > "$ROOT/mbedtls_hw_poll.c" <<'HWC'
+          #include <windows.h>
+          #include <wincrypt.h>
+          #include <stddef.h>
+
+          int mbedtls_hardware_poll(void *data, unsigned char *output, size_t len, size_t *olen)
+          {
+              HCRYPTPROV prov;
+              (void)data;
+              *olen = 0;
+              if (!CryptAcquireContextA(&prov, NULL, NULL, PROV_RSA_FULL,
+                                        CRYPT_VERIFYCONTEXT | CRYPT_SILENT))
+                  return -0x003C;
+              while (len > 0) {
+                  DWORD c = len > 65536 ? 65536 : (DWORD)len;
+                  if (!CryptGenRandom(prov, c, output)) {
+                      CryptReleaseContext(prov, 0);
+                      return -0x003C;
+                  }
+                  output += c;
+                  len -= c;
+                  *olen += c;
+              }
+              CryptReleaseContext(prov, 0);
+              return 0;
+          }
+          HWC
+            run mbedtls make lib WINDOWS=1 CC="$CC" AR="$AR" CFLAGS="$CPPFLAGS $CFLAGS" -j"$JOBS" || return 1
+            run mbedtls "$CC" $CPPFLAGS $CFLAGS -c "$ROOT/mbedtls_hw_poll.c" -o "$ROOT/mbedtls_hw_poll.o" || return 1
+            "$AR" rcs library/libmbedcrypto.a "$ROOT/mbedtls_hw_poll.o" || return 1
             cp -r include/mbedtls include/psa "$PREFIX/include/" || return 1
             cp library/libmbedtls.a library/libmbedx509.a library/libmbedcrypto.a "$PREFIX/lib/" || return 1
-            printf '%s\n' \
-              "prefix=$PREFIX" \
-              'exec_prefix=${prefix}' \
-              'libdir=${exec_prefix}/lib' \
-              'includedir=${prefix}/include' \
-              '' \
-              'Name: mbedtls' \
-              'Description: mbed TLS' \
-              'Version: 3.6.3' \
-              'Libs: -L${libdir} -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -ladvapi32' \
-              'Cflags: -I${includedir}' \
-              > "$PREFIX/lib/pkgconfig/mbedtls.pc" || return 1
+            cat > "$PREFIX/lib/pkgconfig/mbedtls.pc" <<MBPC
+          prefix=$PREFIX
+          Name: mbedtls
+          Description: mbed TLS
+          Version: 3.6.3
+          Libs: -L$PREFIX/lib -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -ladvapi32
+          Cflags: -I$PREFIX/include
+          MBPC
           }
-          TLS_OK=0
+          echo "::group::mbedtls 3.6.3"
           if build_mbedtls; then
             TLS_OK=1
           else
-            echo "::warning::mbedtls nao compilou; o FFmpeg sera compilado sem TLS (sem HTTPS)"
+            echo "::warning::mbedtls falhou; o FFmpeg sera compilado SEM TLS (sem https)."
           fi
+          echo "::endgroup::"
+          cd "$ROOT"
 
-          # ---------- [6/10] SDL2 ----------
-          echo "=== [6/10] SDL2 (para o ffplay) ==="
+          echo "::group::SDL2 2.28.5"
           fetch https://github.com/libsdl-org/SDL/releases/download/release-2.28.5/SDL2-2.28.5.tar.gz
           cd "$SRC/SDL2-2.28.5"
-          run sdl2 ./configure --host="$HOST" --prefix="$PREFIX" \
-            --disable-shared --enable-static \
+          run sdl2 ./configure --host="$HOST" --prefix="$PREFIX" --disable-shared --enable-static \
             --disable-sensor --disable-hidapi --disable-power --disable-haptic
           run sdl2 make -j"$JOBS"
           run sdl2 make install
+          echo "::endgroup::"
 
-          # ---------- [7/10] libogg + libvorbis ----------
-          echo "=== [7/10] libogg + libvorbis ==="
+          echo "::group::libogg 1.3.5"
           fetch https://downloads.xiph.org/releases/ogg/libogg-1.3.5.tar.xz
           cd "$SRC/libogg-1.3.5"
           run ogg ./configure --host="$HOST" --prefix="$PREFIX" --disable-shared --enable-static
           run ogg make -j"$JOBS"
           run ogg make install
+          echo "::endgroup::"
 
+          echo "::group::libvorbis 1.3.7"
           fetch https://downloads.xiph.org/releases/vorbis/libvorbis-1.3.7.tar.xz
           cd "$SRC/libvorbis-1.3.7"
-          run vorbis ./configure --host="$HOST" --prefix="$PREFIX" \
-            --disable-shared --enable-static --disable-oggtest \
-            --disable-examples --disable-docs
+          run vorbis ./configure --host="$HOST" --prefix="$PREFIX" --disable-shared --enable-static \
+            --disable-oggtest --disable-examples --disable-docs
           run vorbis make -j"$JOBS"
           run vorbis make install
+          echo "::endgroup::"
 
-          # ---------- [8/10] opus ----------
-          echo "=== [8/10] libopus ==="
+          echo "::group::opus 1.5.2"
           fetch https://downloads.xiph.org/releases/opus/opus-1.5.2.tar.gz
           cd "$SRC/opus-1.5.2"
-          run opus ./configure --host="$HOST" --prefix="$PREFIX" \
-            --disable-shared --enable-static --disable-doc --disable-extra-programs
+          run opus ./configure --host="$HOST" --prefix="$PREFIX" --disable-shared --enable-static \
+            --disable-doc --disable-extra-programs
           run opus make -j"$JOBS"
           run opus make install
+          echo "::endgroup::"
 
-          # ---------- [9/10] lame ----------
-          echo "=== [9/10] libmp3lame ==="
+          echo "::group::lame 3.100"
           fetch https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz
           cd "$SRC/lame-3.100"
-          run lame ./configure --host="$HOST" --prefix="$PREFIX" \
-            --disable-shared --enable-static --enable-nasm \
-            --disable-frontend --disable-decoder
+          run lame ./configure --host="$HOST" --prefix="$PREFIX" --disable-shared --enable-static \
+            --enable-nasm --disable-frontend --disable-decoder
           run lame make -j"$JOBS"
           run lame make install
+          echo "::endgroup::"
 
-          # ---------- [10/10] x264 ----------
-          echo "=== [10/10] x264 ==="
-          git clone --depth 1 --branch stable https://code.videolan.org/videolan/x264.git "$SRC/x264" >> "$LOGS/x264_clone.log" 2>&1
+          echo "::group::x264 (stable)"
+          run x264 git clone --depth 1 --branch stable https://code.videolan.org/videolan/x264.git "$SRC/x264"
           cd "$SRC/x264"
           run x264 ./configure --host="$HOST" --cross-prefix="${HOST}-" --prefix="$PREFIX" \
-            --enable-static --enable-strip --enable-win32thread \
-            --disable-cli --disable-swscale --disable-lavf \
-            --disable-ffms --disable-gpac --disable-lsmash --disable-opencl
+            --enable-static --enable-strip --enable-win32thread --disable-cli --disable-swscale \
+            --disable-lavf --disable-ffms --disable-gpac --disable-lsmash --disable-opencl
           run x264 make -j"$JOBS"
           run x264 make install
+          echo "::endgroup::"
 
-          # ---------- FFmpeg ----------
-          # o configure do FFmpeg nao deve herdar variaveis dos pacotes anteriores
+          # ======================================================
+          # FFmpeg (sherpya)
+          # ======================================================
           unset CC CXX AR RANLIB STRIP WINDRES DLLTOOL CPPFLAGS CFLAGS CXXFLAGS LDFLAGS
 
-          echo "=== FFmpeg: $UPSTREAM @ $COMMIT_SHA ==="
+          echo "::group::Obter codigo do FFmpeg"
           mkdir -p "$SRC/ffmpeg"
           cd "$SRC/ffmpeg"
-          git init -q
+          git init -q .
           git remote add origin "https://github.com/$UPSTREAM.git"
-          git fetch -q --depth 1 origin "$COMMIT_SHA"
+          git fetch --depth 1 origin "$COMMIT_SHA"
           git checkout -q FETCH_HEAD
+          git log -1 --format='%H%n%an%n%ad%n%s'
+          echo "::endgroup::"
 
-          # --- Patch XP 1: WC_ERR_INVALID_CHARS e Vista+ (no XP o WideCharToMultiByte
-          #     com CP_UTF8 so aceita flags == 0) ---
+          # ---------- Patch XP 1: WC_ERR_INVALID_CHARS (Vista+) ----------
           echo "::group::Patch XP 1 (WC_ERR_INVALID_CHARS)"
-          mapfile -t PFILES < <(grep -rIl --include='*.c' --include='*.h' --include='*.cpp' --include='*.cc' \
-                                  -w "WC_ERR_INVALID_CHARS" . || true)
-          echo "Ficheiros com WC_ERR_INVALID_CHARS: ${#PFILES[@]}"
-          for f in "${PFILES[@]}"; do
-            echo "  patch: $f"
-            sed -i 's/\bWC_ERR_INVALID_CHARS\b/0/g' "$f"
-          done
-          if grep -rIq --include='*.c' --include='*.h' --include='*.cpp' --include='*.cc' \
-               -w "WC_ERR_INVALID_CHARS" . ; then
+          files="$(grep -rlw 'WC_ERR_INVALID_CHARS' --include='*.c' --include='*.h' --include='*.cpp' --include='*.cc' . || true)"
+          count=0
+          if [ -n "$files" ]; then
+            while IFS= read -r f; do
+              sed -i 's/\bWC_ERR_INVALID_CHARS\b/0/g' "$f"
+              count=$((count + 1))
+              echo "patched: $f"
+            done <<<"$files"
+          fi
+          if grep -rqw 'WC_ERR_INVALID_CHARS' --include='*.c' --include='*.h' --include='*.cpp' --include='*.cc' . ; then
             echo "::error::Ainda ha referencias a WC_ERR_INVALID_CHARS"
             exit 1
           fi
-          echo "OK: sem referencias restantes"
+          echo "$count ficheiro(s) alterado(s)"
           echo "::endgroup::"
 
-          # --- Patch XP 2: camada de compatibilidade para threads/sincronizacao ---
-          # O compat/w32pthreads.h deste commit usa SRWLock, CONDITION_VARIABLE e
-          # InitOnce (so existem a partir do Vista). Aqui sao fornecidas versoes
-          # proprias, com o prototipo correto, so com APIs que o XP tem.
-          echo "::group::Patch XP 2 (threads / sincronizacao)"
-          cat > compat/xp_compat.h <<'XPEOF'
+          # ---------- Patch XP 2: camada de compatibilidade (SRWLock/CondVar/InitOnce) ----------
+          echo "::group::Patch XP 2 (camada de compatibilidade)"
+          cat > compat/xp_compat.h <<'XPH'
           #ifndef XP_COMPAT_H
           #define XP_COMPAT_H
+
           #include <windows.h>
+
           #ifdef __cplusplus
           extern "C" {
           #endif
-          VOID    WINAPI InitializeSRWLock(SRWLOCK *l);
-          VOID    WINAPI AcquireSRWLockExclusive(SRWLOCK *l);
-          VOID    WINAPI ReleaseSRWLockExclusive(SRWLOCK *l);
-          BOOLEAN WINAPI TryAcquireSRWLockExclusive(SRWLOCK *l);
-          VOID    WINAPI InitializeConditionVariable(CONDITION_VARIABLE *c);
-          VOID    WINAPI WakeConditionVariable(CONDITION_VARIABLE *c);
-          VOID    WINAPI WakeAllConditionVariable(CONDITION_VARIABLE *c);
-          BOOL    WINAPI SleepConditionVariableSRW(CONDITION_VARIABLE *c, SRWLOCK *l, DWORD ms, ULONG flags);
-          BOOL    WINAPI InitOnceBeginInitialize(INIT_ONCE *o, DWORD flags, BOOL *pending, LPVOID *ctx);
-          BOOL    WINAPI InitOnceComplete(INIT_ONCE *o, DWORD flags, LPVOID ctx);
+
+          #ifndef INIT_ONCE_CHECK_ONLY
+          #define INIT_ONCE_CHECK_ONLY 0x00000001UL
+          #endif
+          #ifndef INIT_ONCE_ASYNC
+          #define INIT_ONCE_ASYNC 0x00000002UL
+          #endif
+          #ifndef INIT_ONCE_INIT_FAILED
+          #define INIT_ONCE_INIT_FAILED 0x00000004UL
+          #endif
+
+          void    WINAPI InitializeSRWLock(PSRWLOCK l);
+          void    WINAPI AcquireSRWLockExclusive(PSRWLOCK l);
+          void    WINAPI ReleaseSRWLockExclusive(PSRWLOCK l);
+          BOOLEAN WINAPI TryAcquireSRWLockExclusive(PSRWLOCK l);
+
+          void    WINAPI InitializeConditionVariable(PCONDITION_VARIABLE cv);
+          void    WINAPI WakeConditionVariable(PCONDITION_VARIABLE cv);
+          void    WINAPI WakeAllConditionVariable(PCONDITION_VARIABLE cv);
+          BOOL    WINAPI SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK srw,
+                                                   DWORD ms, ULONG flags);
+
+          BOOL    WINAPI InitOnceBeginInitialize(PINIT_ONCE once, DWORD flags,
+                                                 PBOOL pending, LPVOID *ctx);
+          BOOL    WINAPI InitOnceComplete(PINIT_ONCE once, DWORD flags, LPVOID ctx);
+
+          /* Vista+: usa a API real se existir, senao falha de forma limpa */
+          BOOL    WINAPI CancelSynchronousIo(HANDLE thread);
+
           #ifdef __cplusplus
           }
           #endif
-          #endif
-          XPEOF
 
-          cat > compat/xp_compat.c <<'XPEOF'
-          /* Emulacao XP das primitivas Vista+ usadas pelo w32pthreads.h.
-           * Funciona com inicializacao a zero (SRWLOCK_INIT, CONDITION_VARIABLE_INIT,
-           * INIT_ONCE_STATIC_INIT), como as originais. */
+          #endif
+          XPH
+
+          cat > compat/xp_compat.c <<'XPC'
           #include <windows.h>
-          #include <wincrypt.h>
           #include <stddef.h>
           #include "xp_compat.h"
 
+          /* ---------- espera com recuo progressivo ---------- */
           static void xp_backoff(unsigned *n)
           {
               unsigned i = (*n)++;
@@ -389,42 +435,30 @@ jobs:
                   Sleep(1);
           }
 
-          static void xp_lock(volatile LONG *p)
-          {
-              unsigned n = 0;
-              while (InterlockedCompareExchange(p, 1, 0) != 0) {
-                  while (*p != 0)
-                      xp_backoff(&n);
-              }
-          }
-
-          static void xp_unlock(volatile LONG *p)
-          {
-              InterlockedExchange(p, 0);
-          }
-
-          /* ---- mutex (SRWLOCK exclusivo) ---- */
-          VOID WINAPI InitializeSRWLock(SRWLOCK *l)
+          /* ---------- SRWLOCK (spinlock exclusivo) ---------- */
+          void WINAPI InitializeSRWLock(PSRWLOCK l)
           {
               l->Ptr = NULL;
           }
 
-          VOID WINAPI AcquireSRWLockExclusive(SRWLOCK *l)
+          void WINAPI AcquireSRWLockExclusive(PSRWLOCK l)
           {
-              xp_lock((volatile LONG *)&l->Ptr);
+              unsigned n = 0;
+              while (InterlockedCompareExchangePointer(&l->Ptr, (PVOID)1, NULL) != NULL)
+                  xp_backoff(&n);
           }
 
-          VOID WINAPI ReleaseSRWLockExclusive(SRWLOCK *l)
+          void WINAPI ReleaseSRWLockExclusive(PSRWLOCK l)
           {
-              xp_unlock((volatile LONG *)&l->Ptr);
+              InterlockedExchangePointer(&l->Ptr, NULL);
           }
 
-          BOOLEAN WINAPI TryAcquireSRWLockExclusive(SRWLOCK *l)
+          BOOLEAN WINAPI TryAcquireSRWLockExclusive(PSRWLOCK l)
           {
-              return InterlockedCompareExchange((volatile LONG *)&l->Ptr, 1, 0) == 0;
+              return (BOOLEAN)(InterlockedCompareExchangePointer(&l->Ptr, (PVOID)1, NULL) == NULL);
           }
 
-          /* ---- variaveis de condicao ---- */
+          /* ---------- CONDITION_VARIABLE (lista de espera) ---------- */
           typedef struct xp_waiter {
               struct xp_waiter *next;
               HANDLE ev;
@@ -432,446 +466,210 @@ jobs:
 
           static volatile LONG g_cv_lock = 0;
 
-          VOID WINAPI InitializeConditionVariable(CONDITION_VARIABLE *c)
+          static void cv_lock(void)
           {
-              c->Ptr = NULL;
+              unsigned n = 0;
+              while (InterlockedCompareExchange(&g_cv_lock, 1, 0) != 0)
+                  xp_backoff(&n);
           }
 
-          BOOL WINAPI SleepConditionVariableSRW(CONDITION_VARIABLE *c, SRWLOCK *l, DWORD ms, ULONG flags)
+          static void cv_unlock(void)
+          {
+              InterlockedExchange(&g_cv_lock, 0);
+          }
+
+          static void cv_append(PCONDITION_VARIABLE cv, xp_waiter *w)
+          {
+              xp_waiter **pp = (xp_waiter **)&cv->Ptr;
+              while (*pp)
+                  pp = &(*pp)->next;
+              *pp = w;
+          }
+
+          static int cv_remove(PCONDITION_VARIABLE cv, xp_waiter *w)
+          {
+              xp_waiter **pp = (xp_waiter **)&cv->Ptr;
+              while (*pp) {
+                  if (*pp == w) {
+                      *pp = w->next;
+                      return 1;
+                  }
+                  pp = &(*pp)->next;
+              }
+              return 0;
+          }
+
+          void WINAPI InitializeConditionVariable(PCONDITION_VARIABLE cv)
+          {
+              cv->Ptr = NULL;
+          }
+
+          void WINAPI WakeConditionVariable(PCONDITION_VARIABLE cv)
+          {
+              xp_waiter *w;
+              cv_lock();
+              w = (xp_waiter *)cv->Ptr;
+              if (w) {
+                  HANDLE h = w->ev;
+                  cv->Ptr = w->next;
+                  SetEvent(h);
+              }
+              cv_unlock();
+          }
+
+          void WINAPI WakeAllConditionVariable(PCONDITION_VARIABLE cv)
+          {
+              xp_waiter *w;
+              cv_lock();
+              w = (xp_waiter *)cv->Ptr;
+              cv->Ptr = NULL;
+              while (w) {
+                  xp_waiter *next = w->next;
+                  HANDLE h = w->ev;
+                  SetEvent(h);
+                  w = next;
+              }
+              cv_unlock();
+          }
+
+          BOOL WINAPI SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK srw,
+                                                DWORD ms, ULONG flags)
           {
               xp_waiter w;
-              xp_waiter **head = (xp_waiter **)&c->Ptr;
-              BOOL signaled;
               DWORD r;
+              int signaled;
               (void)flags;
 
+              w.next = NULL;
               w.ev = CreateEventA(NULL, FALSE, FALSE, NULL);
-              if (!w.ev)
+              if (!w.ev) {
+                  SetLastError(ERROR_NOT_ENOUGH_MEMORY);
                   return FALSE;
+              }
 
-              xp_lock(&g_cv_lock);
-              w.next = *head;
-              *head = &w;
-              xp_unlock(&g_cv_lock);
+              cv_lock();
+              cv_append(cv, &w);
+              cv_unlock();
 
-              ReleaseSRWLockExclusive(l);
+              ReleaseSRWLockExclusive(srw);
               r = WaitForSingleObject(w.ev, ms);
+              signaled = (r == WAIT_OBJECT_0);
 
-              if (r == WAIT_OBJECT_0) {
-                  signaled = TRUE;
-              } else {
-                  /* timeout: sair da lista se ainda la estiver */
-                  xp_waiter **pp;
-                  xp_lock(&g_cv_lock);
-                  pp = head;
-                  while (*pp && *pp != &w)
-                      pp = &(*pp)->next;
-                  if (*pp == &w) {
-                      *pp = w.next;
-                      signaled = FALSE;
-                  } else {
-                      signaled = TRUE; /* foi sinalizado entretanto */
-                  }
-                  xp_unlock(&g_cv_lock);
+              if (!signaled) {
+                  cv_lock();
+                  if (!cv_remove(cv, &w))
+                      signaled = 1;           /* um Wake chegou ao mesmo tempo */
+                  cv_unlock();
+                  if (signaled)
+                      WaitForSingleObject(w.ev, INFINITE);
               }
 
               CloseHandle(w.ev);
-              AcquireSRWLockExclusive(l);
-              if (!signaled)
+              AcquireSRWLockExclusive(srw);
+
+              if (!signaled) {
                   SetLastError(ERROR_TIMEOUT);
-              return signaled;
-          }
-
-          VOID WINAPI WakeConditionVariable(CONDITION_VARIABLE *c)
-          {
-              xp_waiter **head = (xp_waiter **)&c->Ptr;
-              xp_lock(&g_cv_lock);
-              if (*head) {
-                  xp_waiter **pp = head;
-                  HANDLE ev;
-                  while ((*pp)->next)
-                      pp = &(*pp)->next;
-                  ev = (*pp)->ev;
-                  *pp = NULL;
-                  SetEvent(ev);
+                  return FALSE;
               }
-              xp_unlock(&g_cv_lock);
+              return TRUE;
           }
 
-          VOID WINAPI WakeAllConditionVariable(CONDITION_VARIABLE *c)
+          /* ---------- INIT_ONCE (0 = por fazer, 1 = a correr, ctx|2 = feito) ---------- */
+          BOOL WINAPI InitOnceBeginInitialize(PINIT_ONCE once, DWORD flags,
+                                              PBOOL pending, LPVOID *ctx)
           {
-              xp_waiter **head = (xp_waiter **)&c->Ptr;
-              xp_waiter *n;
-              xp_lock(&g_cv_lock);
-              n = *head;
-              *head = NULL;
-              while (n) {
-                  xp_waiter *next = n->next;
-                  HANDLE ev = n->ev;
-                  SetEvent(ev);
-                  n = next;
-              }
-              xp_unlock(&g_cv_lock);
-          }
-
-          /* ---- pthread_once (INIT_ONCE): 0 = por fazer, 1 = a correr, 2 = feito ---- */
-          BOOL WINAPI InitOnceBeginInitialize(INIT_ONCE *o, DWORD flags, BOOL *pending, LPVOID *ctx)
-          {
-              volatile LONG *p = (volatile LONG *)&o->Ptr;
               unsigned n = 0;
-              (void)flags;
+
+              if (flags & INIT_ONCE_CHECK_ONLY) {
+                  PVOID cur = once->Ptr;
+                  if (((ULONG_PTR)cur & 3) == 2) {
+                      *pending = FALSE;
+                      if (ctx)
+                          *ctx = (PVOID)((ULONG_PTR)cur & ~(ULONG_PTR)3);
+                      return TRUE;
+                  }
+                  SetLastError(ERROR_GEN_FAILURE);
+                  return FALSE;
+              }
+
               for (;;) {
-                  LONG s = InterlockedCompareExchange(p, 1, 0);
-                  if (s == 0) {
+                  PVOID old = InterlockedCompareExchangePointer(&once->Ptr, (PVOID)1, NULL);
+                  if (old == NULL) {
                       *pending = TRUE;
                       return TRUE;
                   }
-                  if (s == 2) {
+                  if (((ULONG_PTR)old & 3) == 2) {
                       *pending = FALSE;
                       if (ctx)
-                          *ctx = NULL;
+                          *ctx = (PVOID)((ULONG_PTR)old & ~(ULONG_PTR)3);
                       return TRUE;
                   }
                   xp_backoff(&n);
               }
           }
 
-          BOOL WINAPI InitOnceComplete(INIT_ONCE *o, DWORD flags, LPVOID ctx)
+          BOOL WINAPI InitOnceComplete(PINIT_ONCE once, DWORD flags, LPVOID ctx)
           {
-              (void)ctx;
-              /* 0x4 = INIT_ONCE_INIT_FAILED */
-              InterlockedExchange((volatile LONG *)&o->Ptr, (flags & 0x4) ? 0 : 2);
+              if (flags & INIT_ONCE_INIT_FAILED)
+                  InterlockedExchangePointer(&once->Ptr, NULL);
+              else
+                  InterlockedExchangePointer(&once->Ptr, (PVOID)((ULONG_PTR)ctx | 2));
               return TRUE;
           }
 
-          /* ---- entropia para o mbedtls (CryptGenRandom existe no XP) ---- */
-          int mbedtls_hardware_poll(void *data, unsigned char *output, size_t len, size_t *olen)
+          /* ---------- CancelSynchronousIo (Vista+) ---------- */
+          BOOL WINAPI CancelSynchronousIo(HANDLE thread)
           {
-              HCRYPTPROV prov = 0;
-              size_t off = 0;
-              (void)data;
-              *olen = 0;
-              if (!CryptAcquireContextA(&prov, NULL, NULL, PROV_RSA_FULL,
-                                        CRYPT_VERIFYCONTEXT | CRYPT_SILENT))
-                  return -0x003C; /* MBEDTLS_ERR_ENTROPY_SOURCE_FAILED */
-              while (off < len) {
-                  size_t left = len - off;
-                  DWORD chunk = left > 65536 ? 65536 : (DWORD)left;
-                  if (!CryptGenRandom(prov, chunk, output + off)) {
-                      CryptReleaseContext(prov, 0);
-                      return -0x003C;
-                  }
-                  off += chunk;
+              typedef BOOL (WINAPI *fn_t)(HANDLE);
+              fn_t fn = (fn_t)GetProcAddress(GetModuleHandleA("kernel32.dll"), "CancelSynchronousIo");
+              if (!fn) {
+                  SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+                  return FALSE;
               }
-              CryptReleaseContext(prov, 0);
-              *olen = len;
-              return 0;
+              return fn(thread);
           }
-          XPEOF
 
-          if ! grep -q '^#include <windows.h>' compat/w32pthreads.h; then
-            echo "::error::compat/w32pthreads.h nao tem '#include <windows.h>' (estrutura mudou)"
-            sed -n 1,40p compat/w32pthreads.h
-            exit 1
-          fi
-          sed -i '0,/^#include <windows.h>/s//#include <windows.h>\n#include "xp_compat.h"/' compat/w32pthreads.h
+          /* ---------- pthread_gethandle (usado pelo udp.c do fork) ----------
+             O primeiro campo de pthread_t no w32pthreads e o handle da thread. */
+          typedef struct xp_pthread_s {
+              void *handle;
+              void *(*func)(void *);
+              void *arg;
+              void *ret;
+          } xp_pthread_s;
+
+          HANDLE pthread_gethandle(xp_pthread_s thread)
+          {
+              return (HANDLE)thread.handle;
+          }
+          XPC
+
+          test -f compat/w32pthreads.h || { echo "::error::compat/w32pthreads.h nao existe"; exit 1; }
+          python3 - <<'PY'
+          import re, sys
+          p = 'compat/w32pthreads.h'
+          with open(p, 'r', encoding='utf-8', errors='surrogateescape', newline='') as f:
+              s = f.read()
+          if '"xp_compat.h"' in s:
+              print('w32pthreads.h ja tinha xp_compat.h')
+              sys.exit(0)
+          new, n = re.subn(r'(?m)^(#[ \t]*include[ \t]*<windows\.h>[^\r\n]*(\r?\n))',
+                           lambda m: m.group(1) + '#include "xp_compat.h"' + m.group(2), s, count=1)
+          if n != 1:
+              print('::error::#include <windows.h> nao encontrado em compat/w32pthreads.h')
+              sys.exit(1)
+          with open(p, 'w', encoding='utf-8', errors='surrogateescape', newline='') as f:
+              f.write(new)
+          print('w32pthreads.h alterado')
+          PY
           grep -n 'xp_compat.h' compat/w32pthreads.h
-          if ! grep -q 'xp_compat.h' compat/w32pthreads.h; then
-            echo "::error::Patch do w32pthreads.h nao foi aplicado"
-            exit 1
-          fi
 
           XP_OBJ="$ROOT/xp_compat.o"
-          run xp_compat "${HOST}-gcc" $CPU_FLAGS $XP_CPPFLAGS -Icompat -c compat/xp_compat.c -o "$XP_OBJ"
-          ls -l "$XP_OBJ"
+          run xp_compat "${HOST}-gcc" $CPU_FLAGS -fno-strict-aliasing $XP_CPPFLAGS -Icompat -c compat/xp_compat.c -o "$XP_OBJ"
           echo "::endgroup::"
 
-          # --- opcoes opcionais: so se existirem neste fork ---
-          HELP="$(./configure --help)"
-          have_opt() {
-            grep -q -- "--disable-$1" <<<"$HELP" && return 0
-            grep -Eq "^[[:space:]]+$1[[:space:]]*$" configure && return 0
-            return 1
-          }
-          OPT_FLAGS=()
-          ACCEPTED=""
-          for o in bcrypt mediafoundation d3d11va d3d12va dxva2 vulkan schannel; do
-            if have_opt "$o"; then
-              OPT_FLAGS+=("--disable-$o")
-              ACCEPTED="$ACCEPTED --disable-$o"
-            fi
-          done
-          echo "Flags opcionais aceites:$ACCEPTED"
+          echo "::group::Diagnostico: pthread_gethandle"
+          grep -rn 'pthread_gethandle' --include='*.c' --include='*.h' . || echo "(nenhuma ocorrencia)"
+          echo "::endgroup::"
 
-          FF_ARGS=(
-            --prefix="$PREFIX"
-            --arch=x86_32
-            --cpu="$FF_CPU"
-            --target-os=mingw32
-            --cross-prefix="${HOST}-"
-            --pkg-config=pkg-config
-            --pkg-config-flags="--static"
-            --optflags="$CPU_FLAGS"
-            --extra-cflags="$FF_CPPFLAGS -I$PREFIX/include"
-            --extra-ldflags="$XP_LDFLAGS -L$PREFIX/lib -static -static-libgcc"
-            --extra-libs="$XP_OBJ -lws2_32 -lwinmm -lgdi32 -lole32 -loleaut32 -limm32 -lversion -luuid -ladvapi32 -lshell32 -lsetupapi -lm"
-            --enable-static --disable-shared
-            --enable-gpl --enable-version3
-            --enable-w32threads --disable-pthreads
-            --enable-runtime-cpudetect
-            --enable-ffmpeg --enable-ffplay --enable-ffprobe
-            --disable-doc --disable-debug --enable-stripping
-            --enable-zlib --enable-bzlib --enable-lzma --enable-iconv
-            --enable-sdl2
-            --enable-libmp3lame --enable-libvorbis --enable-libopus --enable-libx264
-            "${OPT_FLAGS[@]}"
-          )
-
-          # $1 = mbedtls | none ; $2 = 1 para nao mostrar o erro
-          do_configure() {
-            local extra=()
-            if [ "$1" = "mbedtls" ]; then
-              extra=(--enable-mbedtls)
-            fi
-            RUN_QUIET="${2:-0}" run "ffmpeg_configure_$1" ./configure "${FF_ARGS[@]}" "${extra[@]}"
-          }
-
-          TLS=none
-          if [ "$TLS_OK" = "1" ]; then
-            if do_configure mbedtls 1; then
-              TLS=mbedtls
-            else
-              echo "::warning::configure com mbedtls falhou; a repetir sem TLS (sem HTTPS)"
-              echo "-------- config.log (ultimas 60 linhas, tentativa com mbedtls) --------"
-              tail -n 60 ffbuild/config.log || true
-            fi
-          fi
-          if [ "$TLS" = "none" ]; then
-            if ! do_configure none 0; then
-              echo "-------- config.log (ultimas 80 linhas) --------"
-              tail -n 80 ffbuild/config.log || true
-              exit 1
-            fi
-          fi
-          echo "$TLS" > "$META/tls"
-          echo "TLS: $TLS"
-
-          sed -n '/^External libraries:/,/^$/p' "$LOGS/ffmpeg_configure_$TLS.log"
-          grep -n "WIN32_WINNT" config.h ffbuild/config.mak | cut -c1-240 || true
-
-          # ---------- compilar ----------
-          # -k: continua depois do primeiro erro, para listar todos de uma vez
-          QUIET_BUILD=0
-          if [ "$TLS" = "mbedtls" ]; then
-            QUIET_BUILD=1
-          fi
-          if ! RUN_QUIET="$QUIET_BUILD" run ffmpeg_build make -k -j"$JOBS"; then
-            if [ "$TLS" = "mbedtls" ]; then
-              echo "::warning::A compilacao falhou com mbedtls; a repetir sem TLS (sem HTTPS)"
-              echo "-------- erros da tentativa com mbedtls --------"
-              grep -nE "error:|undefined reference|\*\*\*" "$LOGS/ffmpeg_build.log" | cut -c1-300 | sed -n 1,40p || true
-              mv "$LOGS/ffmpeg_build.log" "$LOGS/ffmpeg_build_mbedtls.log"
-              TLS=none
-              echo "$TLS" > "$META/tls"
-              if ! do_configure none 0; then
-                tail -n 80 ffbuild/config.log || true
-                exit 1
-              fi
-              RUN_QUIET=1 run ffmpeg_clean make clean || true
-              run ffmpeg_build make -k -j"$JOBS"
-            else
-              show_fail ffmpeg_build "make -k -j$JOBS"
-              exit 1
-            fi
-          fi
-
-          # ---------- funcoes sem declaracao = chamada errada em runtime ----------
-          IMPL="$(sed -nE "s/.*implicit declaration of function '([A-Za-z0-9_]+)'.*/\1/p" "$LOGS/ffmpeg_build.log" | sort -u || true)"
-          if [ -n "$IMPL" ]; then
-            echo "::error::O codigo chama funcoes sem declaracao (no XP ficariam com convencao de chamada errada):"
-            echo "$IMPL" | sed 's/^/  /'
-            echo "-------- primeiras ocorrencias --------"
-            grep -n "implicit declaration of function" "$LOGS/ffmpeg_build.log" | cut -c1-260 | sed -n 1,25p || true
-            exit 1
-          fi
-          echo "OK: sem chamadas a funcoes sem declaracao"
-
-          for b in ffmpeg ffplay ffprobe; do
-            if [ ! -f "$b.exe" ]; then
-              echo "::error::$b.exe nao foi gerado"
-              exit 1
-            fi
-          done
-          ls -l ffmpeg.exe ffplay.exe ffprobe.exe
-
-      - name: Validar XP e empacotar
-        run: |
-          set -euo pipefail
-
-          SRC="$ROOT/src"
-          LOGS="$ROOT/logs"
-          META="$ROOT/meta"
-          STAGE="$ROOT/stage"
-          mkdir -p "$STAGE"
-          cd "$SRC/ffmpeg"
-
-          FORBIDDEN_DLL='^(bcrypt|ncrypt|mfplat|d3d11|d3d12|dxva2|api-ms-win|ucrtbase|vcruntime|libwinpthread|libssp|libgcc|libstdc\+\+)'
-          VISTA_API='InitializeSRWLock|AcquireSRWLockExclusive|AcquireSRWLockShared|ReleaseSRWLockExclusive|ReleaseSRWLockShared|TryAcquireSRWLockExclusive|InitializeConditionVariable|SleepConditionVariableCS|SleepConditionVariableSRW|WakeConditionVariable|WakeAllConditionVariable|InitOnceExecuteOnce|InitOnceBeginInitialize|InitOnceComplete|GetTickCount64|WSAPoll|inet_pton|inet_ntop|InetPtonW|InetNtopW|GetFileInformationByHandleEx|SetFileInformationByHandle|GetFinalPathNameByHandleA|GetFinalPathNameByHandleW|CreateSymbolicLinkA|CreateSymbolicLinkW|CompareStringEx|GetSystemTimePreciseAsFileTime|GetUserDefaultLocaleName|LCMapStringEx|GetLogicalProcessorInformationEx|SetThreadDescription|CancelIoEx|GetQueuedCompletionStatusEx|GetThreadId|BCryptGenRandom'
-
-          FAIL=0
-          for b in ffmpeg ffplay ffprobe; do
-            echo "::group::Validar $b.exe"
-            "${HOST}-strip" --strip-all "$b.exe" -o "$STAGE/$b.exe"
-            dump="$LOGS/${b}_objdump.txt"
-            "${HOST}-objdump" -p "$STAGE/$b.exe" > "$dump"
-
-            echo "DLLs importadas:"
-            DLLS="$( (grep -oE 'DLL Name: .*' "$dump" || true) | sed 's/DLL Name: //' | tr 'A-Z' 'a-z' | sort -u )"
-            echo "$DLLS" | sed 's/^/  /'
-
-            BAD_DLL="$(echo "$DLLS" | grep -Ei "$FORBIDDEN_DLL" || true)"
-            if [ -n "$BAD_DLL" ]; then
-              echo "::error::$b.exe importa DLLs que nao existem no XP:"
-              echo "$BAD_DLL"
-              FAIL=1
-            fi
-
-            BAD_API="$(grep -Ew "$VISTA_API" "$dump" | sort -u || true)"
-            if [ -n "$BAD_API" ]; then
-              echo "::error::$b.exe importa funcoes Vista+:"
-              echo "$BAD_API"
-              FAIL=1
-            fi
-
-            if ! grep -Eq '^MajorSubsystemVersion[[:space:]]+5[[:space:]]*$' "$dump" \
-               || ! grep -Eq '^MinorSubsystemVersion[[:space:]]+1[[:space:]]*$' "$dump"; then
-              echo "::error::$b.exe nao tem subsystem version 5.1"
-              grep -E 'SubsystemVersion|OSVersion' "$dump" || true
-              FAIL=1
-            fi
-
-            if [ "$b" != "ffplay" ] && ! grep -q '(Windows CUI)' "$dump"; then
-              echo "::warning::$b.exe nao e uma aplicacao de consola (-mwindows do SDL2?)"
-            fi
-            ls -l "$STAGE/$b.exe"
-            echo "::endgroup::"
-          done
-
-          if [ "$FAIL" -ne 0 ]; then
-            echo "::error::Validacao XP falhou (ver acima)"
-            exit 1
-          fi
-
-          # licencas
-          cp COPYING* LICENSE* README* "$STAGE/" 2>/dev/null || true
-
-          {
-            echo "FFmpeg (fork $UPSTREAM) para Windows XP 32-bit"
-            echo "Commit upstream : $COMMIT_SHA"
-            echo "Tag             : $TAG"
-            echo "Variante        : $VARIANT"
-            echo "TLS (mbedtls)   : $(cat "$META/tls")"
-            echo "Threads         : w32threads com camada de compatibilidade XP (compat/xp_compat.c)"
-            echo "CFLAGS          : $(cat "$META/cpu_flags")"
-            echo "GCC             : $("${HOST}-gcc" --version | sed -n 1p)"
-            echo
-            echo "Configuracao:"
-            grep -m1 '^FFMPEG_CONFIGURATION=' ffbuild/config.mak | sed 's/^FFMPEG_CONFIGURATION=//'
-          } > "$STAGE/BUILD-INFO.txt"
-
-          mkdir -p "$ROOT/out"
-          ZIP="ffmpeg-${TAG}-xp_${VARIANT}.zip"
-          (cd "$STAGE" && zip -9 -r "$ROOT/out/$ZIP" .)
-          ls -l "$ROOT/out"
-          echo "ZIP_PATH=$ROOT/out/$ZIP" >> "$GITHUB_ENV"
-
-      - name: Guardar zip
-        uses: actions/upload-artifact@v4
-        with:
-          name: xp_${{ env.VARIANT }}
-          path: ${{ env.ZIP_PATH }}
-          if-no-files-found: error
-
-      - name: Guardar logs (se falhou)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs_${{ env.VARIANT }}
-          path: build/logs
-          if-no-files-found: ignore
-
-  # ---------------------------------------------------------------------------
-  # 3) RELEASE: publica no teu repositorio
-  # ---------------------------------------------------------------------------
-  release:
-    needs: [check, build]
-    if: needs.check.outputs.build == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Descarregar zips
-        uses: actions/download-artifact@v4
-        with:
-          pattern: xp_*
-          path: dist
-          merge-multiple: true
-
-      - name: Criar release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ needs.check.outputs.tag }}
-          SHA: ${{ needs.check.outputs.sha }}
-          INPUT_FORCE: ${{ inputs.force }}
-        run: |
-          set -euo pipefail
-
-          ls -l dist
-          (cd dist && sha256sum *.zip > SHA256SUMS)
-
-          json="$(gh api "repos/$UPSTREAM/commits/$SHA")"
-          cdate="$(jq -r .commit.committer.date <<<"$json")"
-          author="$(jq -r .commit.author.name <<<"$json")"
-          jq -r .commit.message <<<"$json" | sed -E "s|#([0-9]+)|${UPSTREAM}#\1|g" > commit_msg.txt
-
-          {
-            echo "## FFmpeg para Windows XP (32-bit)"
-            echo
-            echo "Compilado a partir de [\`${SHA:0:7}\`](https://github.com/$UPSTREAM/commit/$SHA) do [$UPSTREAM](https://github.com/$UPSTREAM)"
-            echo "- Data do commit: $cdate"
-            echo "- Autor: $author"
-            echo
-            echo "### Otimizacao"
-            echo
-            echo "| Variante | Alvo | Flags principais |"
-            echo "|---|---|---|"
-            echo "| \`prescott\` | Pentium 4 Prescott (SSE3) | \`-O2 -march=prescott -mtune=prescott -mfpmath=sse\` |"
-            echo
-            echo "Binarios estaticos e sem simbolos (\`strip\`), validados para nao importarem DLLs/funcoes Vista+."
-            echo "As primitivas de sincronizacao Vista+ do codigo do FFmpeg foram substituidas por uma camada de compatibilidade XP."
-            echo
-            echo "### Incluido"
-            echo
-            echo "ffmpeg.exe, ffplay.exe (SDL2), ffprobe.exe"
-            echo
-            echo "Codecs internos + libx264, libmp3lame, libvorbis, libopus, zlib, bzip2, lzma, iconv e, se compilou, HTTPS via mbedtls (ver \`BUILD-INFO.txt\`)."
-            echo
-            echo "### Commit upstream"
-            echo
-            sed 's/^/> /' commit_msg.txt
-          } > notes.md
-
-          if [ "${INPUT_FORCE:-false}" = "true" ]; then
-            gh release delete "$TAG" --cleanup-tag --yes || true
-          fi
-
-          def="$(gh api "repos/$UPSTREAM" --jq .default_branch)"
-          head="$(gh api "repos/$UPSTREAM/branches/$def" --jq .commit.sha)"
-          latest=false
-          if [ "$head" = "$SHA" ]; then
-            latest=true
-          fi
-
-          gh release create "$TAG" dist/*.zip dist/SHA256SUMS \
-            --title "FFmpeg XP ${TAG}" \
-            --notes-file notes.md \
-            --latest="$latest"
+          # ---------- opcoes opcionais (so se o configure as conhecer) 
