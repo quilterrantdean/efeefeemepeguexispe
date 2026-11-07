@@ -165,7 +165,7 @@ jobs:
           gitc freetype VER-2-13-3  https://github.com/freetype/freetype.git
           gitc SDL2     release-2.32.10 https://github.com/libsdl-org/SDL.git
 
-          # --- shim: GetTickCount64 (winpthreads do mingw-w64 11) e BCryptGenRandom (mbedtls 3.6): nao existem no XP
+          # --- shim: GetTickCount64 (winpthreads), BCryptGenRandom e _vsnprintf_s (mbedtls): nao existem no XP
           cat > "$W/xp_shim.c" <<'EOF'
           #include <windows.h>
           static LONG  g_lock  = 0;
@@ -183,6 +183,24 @@ jobs:
               return r;
           }
           void *xp_imp_GetTickCount64 __asm__("__imp__GetTickCount64@0") = (void *)xp_GetTickCount64;
+
+          /* mbedtls usa _vsnprintf_s (msvcrt.dll do Vista em diante): implementa-se com _vsnprintf */
+          #include <stdarg.h>
+          #include <stddef.h>
+          int __cdecl _vsnprintf(char *, size_t, const char *, va_list);
+          int xp_vsnprintf_s(char *buf, size_t size, size_t count, const char *fmt, va_list ap) __asm__("_vsnprintf_s");
+          int xp_vsnprintf_s(char *buf, size_t size, size_t count, const char *fmt, va_list ap)
+          {
+              size_t limit;
+              int r;
+              if (!buf || !size || !fmt) return -1;
+              limit = size - 1;
+              if (count != (size_t)-1 && count < limit) limit = count;
+              r = _vsnprintf(buf, limit, fmt, ap);
+              if (r < 0 || (size_t)r > limit) { buf[limit] = 0; return -1; }
+              buf[r] = 0;
+              return r;
+          }
 
           /* mbedtls 3.6 usa BCryptGenRandom (bcrypt.dll, so Vista+): implementa-se com CryptGenRandom */
           LONG WINAPI BCryptGenRandom(void *alg, UCHAR *buf, ULONG len, ULONG flags)
@@ -259,8 +277,14 @@ jobs:
             --extra-cflags="-I$PREFIX/include $ARCH_FLAGS -DPSAPI_VERSION=1" \
             --extra-ldflags="-L$PREFIX/lib $W/xp_shim.o -static" 
           grep -E "^(threading support|bcrypt|libx264|libvpx|mbedtls|sdl2|libfreetype|libmp3lame)" "$W/logs/ff-cfg.log" || true
+          # Icones e VERSIONINFO: o Makefile procura fftools/<prog>.rc relativamente ao directorio de
+          # build (nao ao dos fontes), logo numa compilacao fora da arvore tem de se copiar os .rc.
+          # O CPATH deixa o windres encontrar o libavutil/ffversion.h gerado neste directorio.
+          mkdir -p fftools && cp "$FFSRC"/fftools/ffmpeg.rc "$FFSRC"/fftools/ffplay.rc "$FFSRC"/fftools/ffprobe.rc fftools/
+          export CPATH="$W/b-ffmpeg"
           run ff-build make -j"$JOBS"
           run ff-inst  make install
+          unset CPATH
           cd "$ROOT"
 
           # --- verificacao XP ---------------------------------------------------------------------------------
@@ -275,6 +299,12 @@ jobs:
             for d in $(printf '%s\n' "$dump" | sed -n 's/^[[:space:]]*DLL Name: //p'); do
               case " $XP_DLL_ALLOW " in *" $(printf '%s' "$d" | tr 'A-Z' 'a-z') "*) ;; *) echo "  DLL fora da lista XP: $d" >&2; bad=1 ;; esac
             done
+            # msvcrt.dll do XP nao exporta as funcoes "secure CRT" (_s) nem estas outras
+            crt="$(printf '%s\n' "$dump" | awk '/DLL Name/ {d=tolower($3)} /^[ \t]+[0-9a-f]+[ \t]+[0-9]+[ \t]+[A-Za-z_]/ {if (d=="msvcrt.dll") print $3}' \
+                  | grep -E '_s$|^rand_s$|^_set_invalid_parameter_handler$|^_configthreadlocale$|^_create_locale$|^_free_locale$|^_get_current_locale$|^_vscprintf$|^_get_errno$|^_set_errno$' || true)"
+            if [ -n "$crt" ]; then echo "  funcoes do msvcrt inexistentes no XP em $exe.exe:" >&2; printf '%s\n' "$crt" >&2; bad=1; fi
+            rsrc=$(printf '%s\n' "$(${TARGET}-objdump -h "$f")" | awk '$2==".rsrc" {print $3}')
+            if [ -z "$rsrc" ] || [ $((16#$rsrc)) -lt 4096 ]; then echo "  $exe.exe sem icone/VERSIONINFO (.rsrc=$rsrc)" >&2; bad=1; fi
             hits="$(printf '%s\n' "$dump" | grep -E -w "$XP_API_DENY" || true)"
             if [ -n "$hits" ]; then echo "  APIs pos-XP em $exe.exe:" >&2; printf '%s\n' "$hits" >&2; bad=1; fi
           done
