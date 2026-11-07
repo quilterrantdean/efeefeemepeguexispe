@@ -266,6 +266,38 @@ jobs:
           fi
           git -C "$FFSRC" fetch -q origin "$SHA" 2>/dev/null || true
           git -C "$FFSRC" checkout -q "$SHA"
+          # O backend mbedtls so carrega CAs de um ca_file e o tls_verify vem ligado por defeito, logo
+          # sem isto todos os https falham ("certificate is not correctly signed by the trusted CA").
+          # Patch: se nao houver ca_file, usa cacert.pem na pasta do executavel (incluido no pacote);
+          # e aceita bundles em que algum certificado nao seja interpretavel (retorno > 0).
+          python3 - "$FFSRC/libavformat/tls_mbedtls.c" <<'PYEOF'
+          import sys
+          p = sys.argv[1]
+          s = open(p, newline='').read()
+          if 'cacert.pem' not in s:
+              old = """    // load trusted CA\n    if (shr->ca_file) {\n        if ((ret = mbedtls_x509_crt_parse_file(&tls_ctx->ca_cert, shr->ca_file)) != 0) {"""
+              new = """    // load trusted CA (XP build: por defeito, cacert.pem na pasta do executavel)
+          #ifdef _WIN32
+              if (!shr->ca_file) {
+                  char exe_path[MAX_PATH + 16];
+                  DWORD n = GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+                  if (n > 0 && n < MAX_PATH) {
+                      char *sl = strrchr(exe_path, '\\\\');
+                      if (sl) {
+                          strcpy(sl + 1, "cacert.pem");
+                          if (GetFileAttributesA(exe_path) != INVALID_FILE_ATTRIBUTES)
+                              shr->ca_file = av_strdup(exe_path);
+                      }
+                  }
+              }
+          #endif
+              if (shr->ca_file) {
+                  if ((ret = mbedtls_x509_crt_parse_file(&tls_ctx->ca_cert, shr->ca_file)) < 0) {"""
+              if old not in s:
+                  sys.exit("ERRO: patch do tls_mbedtls.c nao aplicavel (o codigo mudou)")
+              open(p, 'w', newline='').write(s.replace(old, new, 1))
+              print("patch tls_mbedtls.c aplicado")
+          PYEOF
           mkdir -p "$W/b-ffmpeg" && cd "$W/b-ffmpeg"
           FFOUT="$W/ffout"
           run ff-cfg "$FFSRC/configure" --prefix="$FFOUT" --target-os=mingw32 --arch=x86 --cpu="$CPU" \
@@ -316,6 +348,9 @@ jobs:
           rm -rf "$OUT"; mkdir -p "$OUT/licenses"
           for exe in ffmpeg ffprobe ffplay; do cp "$FFOUT/bin/$exe.exe" "$OUT/"; ${TARGET}-strip "$OUT/$exe.exe"; done
           cp "$FFSRC"/COPYING.GPLv3 "$FFSRC"/LICENSE.md "$OUT/licenses/" 2>/dev/null || true
+          # Lista de autoridades de certificacao (Mozilla, via pacote ca-certificates); o ffmpeg/ffplay/ffprobe
+          # usam-na por defeito para https quando estiver na mesma pasta dos executaveis.
+          cp /etc/ssl/certs/ca-certificates.crt "$OUT/cacert.pem"
           for d in libogg libvorbis opus lame mbedtls x264 libvpx freetype SDL2; do
             mkdir -p "$OUT/licenses/$d"
             find "$W/src/$d" -maxdepth 1 -type f \( -name 'COPYING*' -o -name 'LICENSE*' -o -name 'LICENCE*' -o -name 'NOTICE*' -o -name 'AUTHORS' \) -exec cp {} "$OUT/licenses/$d/" \;
@@ -326,6 +361,7 @@ jobs:
             echo "Origem: https://github.com/sherpya/FFmpeg/commit/$SHA"
             echo "Compilador: $(${TARGET}-gcc-posix --version | head -n1)"
             echo "Flags de arquitectura: $ARCH_FLAGS (--cpu=$CPU)"
+            echo "https: cacert.pem (CAs da Mozilla, do pacote ca-certificates do Ubuntu) tem de ficar na pasta dos exes; ou usar -ca_file / -tls_verify 0"
             echo "Executaveis estaticos e sem simbolos (strip). Threads: pthreads (winpthreads), GetTickCount64 substituido por shim."
             echo "Bibliotecas incluidas: zlib, SDL2 release-2.32.10, x264 31e19f9, libvpx 1.15.0, opus 1.5.2, libvorbis 1.3.7, libogg 1.3.5, LAME 3.100, freetype 2.13.3, mbedtls 3.6.7"
             echo "Configuracao do FFmpeg:"; grep -E '^FFMPEG_CONFIGURATION=' "$W/b-ffmpeg/config.h" 2>/dev/null || grep -m1 '^# ' "$W/b-ffmpeg/ffbuild/config.log" | cut -c1-2000
